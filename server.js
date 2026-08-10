@@ -116,6 +116,17 @@ app.get('/api/user/:phone/orders', (req, res) => {
   res.json({ success: true, orders: user.orderHistory });
 });
 
+// GET single order status for customer live tracking
+app.get('/api/orders/status/:orderId', (req, res) => {
+  const { orderId } = req.params;
+  const order = liveOrders.find(o => o.id === orderId) || completedOrders.find(o => o.id === orderId);
+  if (order) {
+    res.json({ success: true, order });
+  } else {
+    res.status(404).json({ success: false, error: 'Order not found' });
+  }
+});
+
 // Place New Order — broadcast to ALL connected drivers
 app.post('/api/orders/create', (req, res) => {
   const { customerName, phone, address, items, totalAmount } = req.body;
