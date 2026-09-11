@@ -134,6 +134,42 @@ app.post('/api/user/:phone/profile', async (req, res) => {
   res.json({ success: true, user });
 });
 
+// Website OTP registration — phone.email verified the number, so create the
+// Redis profile (same store the apps use). Firestore users/{phone} is written
+// by the apps when they next see this number; website never writes Firestore.
+app.post('/api/user/register', async (req, res) => {
+  try {
+    const raw = String(req.body.phone || '').replace(/[^0-9]/g, '');
+    const phone = raw.slice(-10);
+    if (phone.length < 10) return res.status(400).json({ success: false, error: 'valid phone required' });
+    const user = await readUser(phone);
+    if (req.body.name) {
+      user.name = String(req.body.name).trim();
+      user.fullName = user.name;
+      const parts = user.name.split(/\s+/);
+      user.firstName = parts[0] || '';
+      user.lastName = parts.slice(1).join(' ') || '';
+    }
+    if (req.body.address) {
+      const addr = String(req.body.address).trim();
+      user.addresses = Array.isArray(user.addresses) ? user.addresses : [];
+      if (!user.addresses.some(a => a.address === addr)) {
+        user.addresses.unshift({ title: 'Website 🏠', address: addr });
+      }
+    }
+    user.role = user.role || 'customer';
+    user.accountStatus = user.accountStatus || 'active';
+    user.approvalStatus = user.approvalStatus || 'approved';
+    if (user.accountStatus === 'blocked') {
+      return res.status(403).json({ success: false, error: 'account blocked' });
+    }
+    await writeUser(phone, user);
+    res.json({ success: true, user: { phone, name: user.name || '', address: (req.body.address || '').trim() } });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // ADDRESS ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -244,6 +280,7 @@ const placeOrderHandler = async (req, res) => {
       status:       'Order Placed & Waiting for Delivery Boy 📝🍳',
       acceptedBy:   null,
       acceptedByName: null,
+      deliveryOtp:  req.body.deliveryOtp || String(1000 + Math.floor(Math.random() * 9000)),
       timestamp:    new Date().toISOString(),
       placedAt:     new Date().toISOString(),
       updatedAt:    new Date().toISOString(),
