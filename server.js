@@ -163,8 +163,51 @@ function postJson(urlStr, payload) {
   });
 }
 
+function getJson(urlStr) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const req = https.request({
+      hostname: u.hostname,
+      path: u.pathname + u.search,
+      method: 'GET',
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch { reject(new Error('bad verification response')); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(15000, () => req.destroy(new Error('verification timed out')));
+    req.end();
+  });
+}
+
 app.post('/api/auth/phone-email/verify', async (req, res) => {
   try {
+    // Official widget flow: the button's phoneEmailListener hands the website
+    // a user_json_url, which only a server may fetch (browser CORS blocked).
+    const userJsonUrl = String(req.body.user_json_url || '').trim();
+    if (userJsonUrl) {
+      let u;
+      try { u = new URL(userJsonUrl); }
+      catch { return res.status(400).json({ success: false, error: 'bad user_json_url' }); }
+      if (u.protocol !== 'https:' || u.hostname !== 'user.phone.email') {
+        return res.status(400).json({ success: false, error: 'bad user_json_url' });
+      }
+      const data = await getJson(userJsonUrl);
+      const raw = `${data.user_country_code ?? ''}${data.user_phone_number ?? ''}`.replace(/[^0-9]/g, '');
+      const phone = raw.slice(-10);
+      if (phone.length < 10) {
+        return res.status(401).json({ success: false, error: 'verification failed' });
+      }
+      const first = String(data.user_first_name ?? '').trim();
+      const last = String(data.user_last_name ?? '').trim();
+      const name = `${first} ${last}`.trim();
+      return res.json({ success: true, phone, name: name || null, jwt: null });
+    }
+    // Legacy redirect flow: access_token exchange (kept as fallback)
     const accessToken = String(req.body.access_token || '').trim();
     if (!accessToken) return res.status(400).json({ success: false, error: 'access_token required' });
     const data = await postJson('https://eapi.phone.email/getuser', {
@@ -176,7 +219,7 @@ app.post('/api/auth/phone-email/verify', async (req, res) => {
     if (data.status !== 200 || phone.length < 10) {
       return res.status(401).json({ success: false, error: 'verification failed' });
     }
-    res.json({ success: true, phone, jwt: data.ph_email_jwt || null });
+    res.json({ success: true, phone, name: null, jwt: data.ph_email_jwt || null });
   } catch (e) {
     res.status(502).json({ success: false, error: e.message || 'verification failed' });
   }
