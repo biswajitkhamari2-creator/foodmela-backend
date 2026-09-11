@@ -134,6 +134,54 @@ app.post('/api/user/:phone/profile', async (req, res) => {
   res.json({ success: true, user });
 });
 
+// Website OTP verification proxy — eapi.phone.email rejects browser-origin
+// requests (CORS), so the website posts the access_token here and the backend
+// (server-to-server, no CORS) exchanges it for the verified phone number.
+const PE_CLIENT_ID = '14442678863809499061';
+
+function postJson(urlStr, payload) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const body = JSON.stringify(payload);
+    const req = https.request({
+      hostname: u.hostname,
+      path: u.pathname,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch { reject(new Error('bad verification response')); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(15000, () => req.destroy(new Error('verification timed out')));
+    req.write(body);
+    req.end();
+  });
+}
+
+app.post('/api/auth/phone-email/verify', async (req, res) => {
+  try {
+    const accessToken = String(req.body.access_token || '').trim();
+    if (!accessToken) return res.status(400).json({ success: false, error: 'access_token required' });
+    const data = await postJson('https://eapi.phone.email/getuser', {
+      access_token: accessToken,
+      client_id: PE_CLIENT_ID,
+    });
+    const raw = `${data.country_code ?? ''}${data.phone_no ?? ''}`.replace(/[^0-9]/g, '');
+    const phone = raw.slice(-10);
+    if (data.status !== 200 || phone.length < 10) {
+      return res.status(401).json({ success: false, error: 'verification failed' });
+    }
+    res.json({ success: true, phone, jwt: data.ph_email_jwt || null });
+  } catch (e) {
+    res.status(502).json({ success: false, error: e.message || 'verification failed' });
+  }
+});
+
 // Website OTP registration — phone.email verified the number, so create the
 // Redis profile (same store the apps use). Firestore users/{phone} is written
 // by the apps when they next see this number; website never writes Firestore.
