@@ -573,6 +573,20 @@ app.delete('/api/orders/clear-delivered', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// IN-APP AUDIO CALLING (Agora RTC + Cloud Recording → S3)
+// Numbers stay hidden: VoIP only, channel = order_<orderId>, active orders only.
+// Env: AGORA_APP_ID, AGORA_APP_CERTIFICATE, AGORA_CUSTOMER_KEY,
+//      AGORA_CUSTOMER_SECRET, AWS_S3_BUCKET, AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_REGION
+// ═══════════════════════════════════════════════════════════════════════════════
+try {
+  const { registerCallRoutes } = require('./agoraCalls');
+  registerCallRoutes(app, { readOrders });
+  console.log('📞 Agora calling routes mounted');
+} catch (e) {
+  console.error('Calling routes mount notice:', e.message);
+}
+
 // ─── START SERVER ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Food Mela Backend running on port ${PORT}`));
