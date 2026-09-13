@@ -6,14 +6,18 @@
 const express = require('express');
 const cors    = require('cors');
 const https   = require('https');
+try { require('dotenv').config({ path: require('path').join(__dirname, '.env') }); } catch (_) {}
+
+// ─── UPSTASH REDIS CONFIG ─────────────────────────────────────────────────────
+// Secrets come from env (Vercel → Settings → Environment Variables).
+// See .env.example. Rotate the old hardcoded token in Upstash dashboard.
+const UPSTASH_URL   = process.env.UPSTASH_URL || 'https://deciding-fish-161177.upstash.io';
+const UPSTASH_TOKEN = process.env.UPSTASH_TOKEN || '';
+if (!UPSTASH_TOKEN) console.warn('⚠️ UPSTASH_TOKEN missing — set it in .env / Vercel env');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-// ─── UPSTASH REDIS CONFIG ─────────────────────────────────────────────────────
-const UPSTASH_URL   = 'https://deciding-fish-161177.upstash.io';
-const UPSTASH_TOKEN = 'gQAAAAAAAnWZAAIgcDEwNzk0NjI3MGJiYjA0ODQ3ODE3ODk2Yjk1ODg3NGZmNA';
 
 const ORDERS_KEY    = 'fm_orders_v1';
 
@@ -574,10 +578,11 @@ app.delete('/api/orders/clear-delivered', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// IN-APP AUDIO CALLING (Agora RTC + Cloud Recording → S3)
+// IN-APP AUDIO CALLING (Agora RTC + Cloud Recording → Firebase Storage)
 // Numbers stay hidden: VoIP only, channel = order_<orderId>, active orders only.
 // Env: AGORA_APP_ID, AGORA_APP_CERTIFICATE, AGORA_CUSTOMER_KEY,
-//      AGORA_CUSTOMER_SECRET, AWS_S3_BUCKET, AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_REGION
+//      AGORA_CUSTOMER_SECRET, RECORDING_STORAGE_BUCKET,
+//      RECORDING_STORAGE_ACCESS_KEY, RECORDING_STORAGE_SECRET_KEY
 // ═══════════════════════════════════════════════════════════════════════════════
 try {
   const { registerCallRoutes } = require('./agoraCalls');
@@ -588,7 +593,11 @@ try {
 }
 
 // ─── START SERVER ─────────────────────────────────────────────────────────────
+// Vercel serverless: export app, don't listen (platform handles it).
+// Local / VPS: listen normally.
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Food Mela Backend running on port ${PORT}`));
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => console.log(`🚀 Food Mela Backend running on port ${PORT}`));
+}
 
 module.exports = app;

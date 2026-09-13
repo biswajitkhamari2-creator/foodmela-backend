@@ -3,7 +3,7 @@
 // Privacy: numbers stay hidden, VoIP only, channel = order_<orderId>.
 // Access: only assigned customerPhone / riderId of an ACTIVE order (stage 0/1/2).
 // Storage: call logs in Upstash Redis (fm_call_logs_v1). Recording files go to
-// Agora Cloud Recording → AWS S3; the file URL is saved on the log.
+// Agora Cloud Recording → Firebase Storage (GCS); the file URL is saved on the log.
 // Mounted from server.js via registerCallRoutes(app, { readOrders }).
 // ─────────────────────────────────────────────────────────────────────────────
 const https = require('https');
@@ -20,17 +20,24 @@ const AGORA_APP_ID = process.env.AGORA_APP_ID || '';
 const AGORA_APP_CERT = process.env.AGORA_APP_CERTIFICATE || '';
 const AGORA_CUST_KEY = process.env.AGORA_CUSTOMER_KEY || '';
 const AGORA_CUST_SECRET = process.env.AGORA_CUSTOMER_SECRET || '';
-const S3_BUCKET = process.env.AWS_S3_BUCKET || '';
-const S3_KEY = process.env.AWS_ACCESS_KEY || '';
-const S3_SECRET = process.env.AWS_SECRET_KEY || '';
-const S3_REGION = process.env.AWS_REGION || 'ap-south-1';
+// ── Recording storage: Firebase Storage (= Google Cloud Storage bucket) ─────
+// Agora vendor 6 = GCS, region 0. Keys are GCS *HMAC interoperability* keys
+// (Cloud Console → Cloud Storage → Settings → Interoperability), NOT Firebase
+// web API keys. Files land under call_recordings/<order>/… as .mp3.
+const REC_BUCKET = process.env.RECORDING_STORAGE_BUCKET || '';
+const REC_KEY = process.env.RECORDING_STORAGE_ACCESS_KEY || '';
+const REC_SECRET = process.env.RECORDING_STORAGE_SECRET_KEY || '';
+
+function recordingPublicUrl(fileName) {
+  return `https://storage.googleapis.com/${REC_BUCKET}/${fileName}`;
+}
 
 const CALL_LOGS_KEY = 'fm_call_logs_v1';
 const RECORD_UID = 999999; // dedicated cloud-recording bot UID
 
 // ─── Upstash helper (same pattern as server.js) ─────────────────────────────
-const UPSTASH_URL = 'https://deciding-fish-161177.upstash.io';
-const UPSTASH_TOKEN = process.env.UPSTASH_TOKEN || 'gQAAAAAAAnWZAAIgcDEwNzk0NjI3MGJiYjA0ODQ3ODE3ODk2Yjk1ODg3NGZmNA';
+const UPSTASH_URL = process.env.UPSTASH_URL || 'https://deciding-fish-161177.upstash.io';
+const UPSTASH_TOKEN = process.env.UPSTASH_TOKEN || '';
 
 function upstash(cmd) {
   return new Promise((resolve, reject) => {
@@ -234,7 +241,7 @@ function registerCallRoutes(app, { readOrders }) {
     try {
       const { callId } = req.body || {};
       if (!AGORA_CUST_KEY || !AGORA_CUST_SECRET) return res.status(500).json({ success: false, error: 'AGORA_CUSTOMER_KEY/SECRET missing' });
-      if (!S3_BUCKET) return res.status(500).json({ success: false, error: 'AWS_S3_BUCKET missing — recording disabled' });
+      if (!REC_BUCKET) return res.status(500).json({ success: false, error: 'RECORDING_STORAGE_BUCKET missing — recording disabled' });
       const logs = await readCallLogs();
       const log = logs.find((l) => l.id === callId);
       if (!log) return res.status(404).json({ success: false, error: 'Call not found' });
@@ -252,9 +259,9 @@ function registerCallRoutes(app, { readOrders }) {
             token: recToken,
             recordingFileConfig: { avFileType: ['mp3'] },
             storageConfig: {
-              vendor: 1, region: 14, bucket: S3_BUCKET,
-              accessKey: S3_KEY, secretKey: S3_SECRET,
-              fileNamePrefix: ['calls', channel.replace(/^order_/, '')],
+              vendor: 6, region: 0, bucket: REC_BUCKET,
+              accessKey: REC_KEY, secretKey: REC_SECRET,
+              fileNamePrefix: ['call_recordings', channel.replace(/^order_/, '')],
             },
           },
         });
@@ -284,7 +291,7 @@ function registerCallRoutes(app, { readOrders }) {
             'POST', { cname: log.channelName, uid: String(RECORD_UID), clientRequest: {} });
           const file = out?.serverResponse?.fileList?.[0];
           const name = typeof file === 'string' ? file : file?.fileName;
-          if (name) log.recordingUrl = `https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/${name}`;
+          if (name) log.recordingUrl = recordingPublicUrl(name);
         } catch (e) { console.error('recording stop notice:', e.message); }
       }
       log.status = 'ended';
@@ -324,11 +331,11 @@ function registerCallRoutes(app, { readOrders }) {
       if (sid && Array.isArray(fileList) && fileList.length) {
         const f = fileList[0];
         const name = typeof f === 'string' ? f : f.fileName;
-        if (name && S3_BUCKET) {
+        if (name && REC_BUCKET) {
           const logs = await readCallLogs();
           const log = logs.find((l) => l.agoraSid === sid);
           if (log) {
-            log.recordingUrl = `https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/${name}`;
+            log.recordingUrl = recordingPublicUrl(name);
             await writeCallLogs(logs);
           }
         }
@@ -345,6 +352,23 @@ function registerCallRoutes(app, { readOrders }) {
       const logs = await readCallLogs();
       const list = logs.filter((l) => l.orderId === req.params.orderId);
       res.json({ success: true, orderId: req.params.orderId, count: list.length, logs: list });
+    } catch (e) {
+      res.status(500).json({ success: false, error: e.message });
+    }
+  });
+
+  // ── ✨ GET /api/admin/call-logs — ALL calls for the admin recordings tab ──
+  // Query: ?orderId=FM-123 (filter), ?status=ended (filter), ?limit=100 (default 100, max 500)
+  app.get('/api/admin/call-logs', async (req, res) => {
+    try {
+      const logs = await readCallLogs();
+      let list = logs;
+      const { orderId, status, limit } = req.query || {};
+      if (orderId) list = list.filter((l) => String(l.orderId) === String(orderId));
+      if (status) list = list.filter((l) => String(l.status) === String(status));
+      const n = Math.min(Math.max(parseInt(String(limit || '100'), 10) || 100, 1), 500);
+      list = list.slice(0, n);
+      res.json({ success: true, count: list.length, total: logs.length, logs: list });
     } catch (e) {
       res.status(500).json({ success: false, error: e.message });
     }
