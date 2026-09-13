@@ -99,6 +99,72 @@ function pushNewOrderToRiders(order) {
   });
 }
 
+// ─── Direct-token FCM (WhatsApp-style incoming-call ring) ─────────────────────
+// Sends a high-priority data+notification push to ONE device token.
+// fullScreenIntent + channel food_mela_calls wakes the screen even if killed.
+function sendFcmToToken(token, title, body, data) {
+  return new Promise(async (resolve) => {
+    try {
+      const fcmToken = await fcmAccessToken();
+      if (!fcmToken) return resolve(false);
+      const sa = fcmServiceAccount();
+      const payload = JSON.stringify({ message: { token, notification: { title, body }, data: { ...(data || {}), click_action: 'FLUTTER_NOTIFICATION_CLICK' }, android: { priority: 'high', notification: { sound: 'default', channel_id: 'food_mela_calls', visibility: 'PUBLIC', notification_priority: 'PRIORITY_MAX' } } } });
+      const req = https.request({ hostname: 'fcm.googleapis.com', path: `/v1/projects/${sa.project_id}/messages:send`, method: 'POST', headers: { 'Authorization': `Bearer ${fcmToken}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } }, (res) => {
+        let d = '';
+        res.on('data', (c) => { d += c; });
+        res.on('end', () => resolve(res.statusCode < 300));
+      });
+      req.on('error', () => resolve(false));
+      req.write(payload);
+      req.end();
+    } catch (_) { resolve(false); }
+  });
+}
+
+// ── POST /api/calls/:orderId/ring { callId, callerRole, receiverToken? } ──
+// WhatsApp-style incoming-call push: reads the receiver's FCM token from the
+// Firestore order doc (customerFcmToken / riderFcmToken) unless caller passes
+// receiverToken directly. Fire-and-forget friendly — always 200s.
+app.post('/api/calls/:orderId/ring', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { callId, callerRole, receiverToken } = req.body || {};
+    const otherRole = callerRole === 'customer' ? 'rider' : 'customer';
+    let token = (receiverToken || '').trim();
+    if (!token) {
+      // Read receiver token from the Firestore order doc (public read rule)
+      try {
+        const path = `/v1/projects/${process.env.FIRESTORE_PROJECT_ID || 'food-mela-notification'}/databases/(default)/documents/orders/${encodeURIComponent(orderId)}`;
+        const doc = await new Promise((resolve) => {
+          const r = https.request({ hostname: 'firestore.googleapis.com', path, method: 'GET' }, (rs) => {
+            let d = '';
+            rs.on('data', (c) => { d += c; });
+            rs.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
+          });
+          r.on('error', () => resolve(null));
+          r.setTimeout(8000, () => { r.destroy(); resolve(null); });
+          r.end();
+        });
+        const f = (doc && doc.fields) || {};
+        const key = otherRole === 'rider' ? 'riderFcmToken' : 'customerFcmToken';
+        token = (f[key] && f[key].stringValue) || '';
+      } catch (_) {}
+    }
+    if (!token) return res.json({ success: true, pushed: false, reason: 'no receiver token yet' });
+    const callerLabel = callerRole === 'rider' ? 'Assigned Rider' : 'Customer';
+    const ok = await sendFcmToToken(
+      token,
+      `📞 Incoming call — Order #${orderId}`,
+      `${callerLabel} is calling you — tap to answer`,
+      { type: 'incoming_call', orderId: String(orderId), callId: String(callId || ''), callerRole: String(callerRole || ''), receiverRole: otherRole },
+    );
+    console.log(ok ? `📞 CALL push sent — order ${orderId} (${callerRole}→${otherRole})` : `⚠️ CALL push failed — order ${orderId}`);
+    res.json({ success: true, pushed: ok });
+  } catch (e) {
+    res.json({ success: true, pushed: false, reason: e.message });
+  }
+});
+
 // ─── UPSTASH JSON ARRAY REST HELPER ───────────────────────────────────────────
 function upstashCommand(cmdArray) {
   return new Promise((resolve, reject) => {
