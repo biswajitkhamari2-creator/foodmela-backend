@@ -21,6 +21,84 @@ app.use(express.json());
 
 const ORDERS_KEY    = 'fm_orders_v1';
 
+// ─── FCM PUSH (rider background/killed-app ring) ──────────────────────────────
+// Service-account JSON comes from env FCM_SERVICE_ACCOUNT (whole JSON string).
+// Order placement fires a data+notification push to topic rider_notifications.
+// The rider app is subscribed to that topic on every dashboard init.
+let _fcmToken = null;
+let _fcmTokenExp = 0;
+function fcmServiceAccount() {
+  try {
+    const raw = process.env.FCM_SERVICE_ACCOUNT || '';
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (_) { return null; }
+}
+function fcmAccessToken() {
+  return new Promise((resolve) => {
+    try {
+      const sa = fcmServiceAccount();
+      if (!sa || !sa.private_key || !sa.client_email) return resolve(null);
+      if (_fcmToken && Date.now() < _fcmTokenExp) return resolve(_fcmToken);
+      const crypto = require('crypto');
+      const now = Math.floor(Date.now() / 1000);
+      const b64u = (o) => Buffer.from(typeof o === 'string' ? o : JSON.stringify(o)).toString('base64url');
+      const header = b64u({ alg: 'RS256', typ: 'JWT' });
+      const claim = b64u({ iss: sa.client_email, scope: 'https://www.googleapis.com/auth/firebase.messaging', aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 });
+      const signer = crypto.createSign('RSA-SHA256');
+      signer.update(header + '.' + claim);
+      const sig = signer.sign(sa.private_key, 'base64url');
+      const body = new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: `${header}.${claim}.${sig}` }).toString();
+      const req = https.request({ hostname: 'oauth2.googleapis.com', path: '/token', method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, (res) => {
+        let d = '';
+        res.on('data', (c) => { d += c; });
+        res.on('end', () => {
+          try {
+            const j = JSON.parse(d);
+            if (j.access_token) { _fcmToken = j.access_token; _fcmTokenExp = Date.now() + 50 * 60 * 1000; return resolve(_fcmToken); }
+          } catch (_) {}
+          resolve(null);
+        });
+      });
+      req.on('error', () => resolve(null));
+      req.write(body);
+      req.end();
+    } catch (_) { resolve(null); }
+  });
+}
+function sendFcmToTopic(topic, title, body, data) {
+  return new Promise(async (resolve) => {
+    try {
+      const token = await fcmAccessToken();
+      if (!token) return resolve(false);
+      const sa = fcmServiceAccount();
+      const payload = JSON.stringify({ message: { topic, notification: { title, body }, data: { ...(data || {}), type: 'new_order', click_action: 'FLUTTER_NOTIFICATION_CLICK' }, android: { priority: 'high', notification: { sound: 'default', channel_id: 'food_mela_orders', visibility: 'PUBLIC' } } } });
+      const req = https.request({ hostname: 'fcm.googleapis.com', path: `/v1/projects/${sa.project_id}/messages:send`, method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } }, (res) => {
+        let d = '';
+        res.on('data', (c) => { d += c; });
+        res.on('end', () => resolve(res.statusCode < 300));
+      });
+      req.on('error', () => resolve(false));
+      req.write(payload);
+      req.end();
+    } catch (_) { resolve(false); }
+  });
+}
+function pushNewOrderToRiders(order) {
+  // Fire-and-forget — never blocks the order response.
+  setImmediate(async () => {
+    try {
+      const ok = await sendFcmToTopic(
+        'rider_notifications',
+        `🛵 New Order #${order.id}`,
+        `${order.customerName || 'Customer'} • ₹${Math.floor(order.amountValue || 0)} — Tap to Accept`,
+        { orderId: String(order.id), amount: String(Math.floor(order.amountValue || 0)) },
+      );
+      console.log(ok ? `📲 FCM push sent for ${order.id}` : `⚠️ FCM push skipped/failed for ${order.id} (no FCM_SERVICE_ACCOUNT?)`);
+    } catch (e) { console.error('FCM push notice:', e.message); }
+  });
+}
+
 // ─── UPSTASH JSON ARRAY REST HELPER ───────────────────────────────────────────
 function upstashCommand(cmdArray) {
   return new Promise((resolve, reject) => {
@@ -394,6 +472,7 @@ const placeOrderHandler = async (req, res) => {
     }
 
     console.log(`🔔 NEW ORDER: ${orderId} by ${customerName}`);
+    pushNewOrderToRiders(newOrder); // background/killed-app ring via FCM
     res.status(201).json({ success: true, order: newOrder });
   } catch (e) {
     console.error('Place order error:', e);
