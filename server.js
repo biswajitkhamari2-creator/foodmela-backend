@@ -72,7 +72,18 @@ function sendFcmToTopic(topic, title, body, data) {
       const token = await fcmAccessToken();
       if (!token) return resolve(false);
       const sa = fcmServiceAccount();
-      const payload = JSON.stringify({ message: { topic, notification: { title, body }, data: { ...(data || {}), type: 'new_order', click_action: 'FLUTTER_NOTIFICATION_CLICK' }, android: { priority: 'high', notification: { sound: 'default', channel_id: 'food_mela_orders', visibility: 'PUBLIC' } } } });
+      // WhatsApp-style incoming call: notification + data push. The
+      // `notification` block lets ANDROID ITSELF wake the screen and fire the
+      // full-screen intent (food_mela_orders channel, PRIORITY_MAX) even when
+      // the app is backgrounded/killed — Dart code alone cannot open a screen
+      // from those states. The app cancels by tag on accept/decline so no
+      // stale copy lingers. Data carries full order fields for the call UI.
+      const strData = {};
+      for (const [k, v] of Object.entries(data || {})) {
+        if (v !== undefined && v !== null) strData[k] = String(v);
+      }
+      const orderTag = String((data && data.orderId) || Date.now());
+      const payload = JSON.stringify({ message: { topic, notification: { title, body }, data: { ...strData, type: 'new_order', title, body, click_action: 'FLUTTER_NOTIFICATION_CLICK' }, android: { priority: 'high', notification: { sound: 'default', channel_id: 'food_mela_orders', tag: orderTag, visibility: 'PUBLIC', notification_priority: 'PRIORITY_MAX' } } } });
       const req = https.request({ hostname: 'fcm.googleapis.com', path: `/v1/projects/${sa.project_id}/messages:send`, method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } }, (res) => {
         let d = '';
         res.on('data', (c) => { d += c; });
@@ -92,12 +103,127 @@ function pushNewOrderToRiders(order) {
         'rider_notifications',
         `🛵 New Order #${order.id}`,
         `${order.customerName || 'Customer'} • ₹${Math.floor(order.amountValue || 0)} — Tap to Accept`,
-        { orderId: String(order.id), amount: String(Math.floor(order.amountValue || 0)) },
+        {
+          orderId: String(order.id),
+          amount: String(Math.floor(order.amountValue || 0)),
+          customerName: order.customerName || 'Customer',
+          address: order.address || '',
+          customerPhone: order.phone || order.customerPhone || '',
+          items: typeof order.items === 'string' ? order.items : '',
+          categoryLabel: order.orderCategoryLabel || '',
+        },
       );
       console.log(ok ? `📲 FCM push sent for ${order.id}` : `⚠️ FCM push skipped/failed for ${order.id} (no FCM_SERVICE_ACCOUNT?)`);
     } catch (e) { console.error('FCM push notice:', e.message); }
   });
 }
+
+// ─── FIRESTORE ORDER WATCHER (server-side new-order push) ───────────────────
+// WHY: the customer app writes orders DIRECTLY to Firestore (never calls
+// /api/orders/place), so pushNewOrderToRiders() never fires. This poller
+// closes that gap WITHOUT any app update: Vercel Cron (or any scheduler)
+// hits GET /api/orders/watch every minute; it lists recent Firestore orders,
+// pushes FCM to rider_notifications for fresh stage-0 ones, and records
+// pushed IDs in Upstash so each order rings exactly once — even if the rider
+// app is killed. Safe to call as often as every 30s.
+// Setup: Vercel → Project → Settings → Cron Jobs → GET /api/orders/watch
+// every minute. No cron? Call it from the admin panel on an interval.
+const WATCHED_KEY = 'fm_watched_orders_v1';
+function firestoreGet(path) {
+  return new Promise((resolve) => {
+    try {
+      const project = process.env.FIRESTORE_PROJECT_ID || 'food-mela-notification';
+      const full = `/v1/projects/${project}/databases/(default)/documents${path}`;
+      const r = https.request({ hostname: 'firestore.googleapis.com', path: full, method: 'GET' }, (rs) => {
+        let d = '';
+        rs.on('data', (c) => { d += c; });
+        rs.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
+      });
+      r.on('error', () => resolve(null));
+      r.setTimeout(10000, () => { r.destroy(); resolve(null); });
+      r.end();
+    } catch (_) { resolve(null); }
+  });
+}
+function fsStr(field) {
+  if (!field) return '';
+  return field.stringValue ?? '';
+}
+function fsNum(field) {
+  if (!field) return 0;
+  if (field.integerValue != null) return Number(field.integerValue);
+  if (field.doubleValue != null) return Number(field.doubleValue);
+  return 0;
+}
+app.get('/api/orders/watch', async (req, res) => {
+  try {
+    const data = await firestoreGet('/orders?pageSize=25&orderBy=createdAt%20desc');
+    const docs = (data && data.documents) || [];
+    let watched = [];
+    try {
+      const r = await upstashCommand(['GET', WATCHED_KEY]);
+      watched = JSON.parse(r.result || '[]');
+      if (!Array.isArray(watched)) watched = [];
+    } catch (_) { watched = []; }
+    const seen = new Set(watched);
+    const fresh = [];
+    const now = Date.now();
+    for (const doc of docs) {
+      const id = (doc.name || '').split('/').pop();
+      if (!id || seen.has(id)) continue;
+      const f = doc.fields || {};
+      const stage = fsNum(f.stage);
+      const deleted = f.isDeleted && f.isDeleted.booleanValue === true;
+      if (deleted || stage !== 0) { seen.add(id); continue; }
+      // Only ring for orders placed in the last 15 min (avoid stale replays)
+      let ageMs = Infinity;
+      try {
+        const ts = (f.createdAt && f.createdAt.timestampValue) || '';
+        if (ts) ageMs = now - new Date(ts).getTime();
+      } catch (_) {}
+      if (!Number.isFinite(ageMs) || ageMs > 15 * 60 * 1000) { seen.add(id); continue; }
+      fresh.push({
+        id,
+        customerName: fsStr(f.customerName) || 'Customer',
+        amountValue: fsNum(f.totalAmount),
+        address: fsStr(f.address),
+        customerPhone: fsStr(f.customerPhone),
+        items: fsStr(f.itemsSummary),
+        categoryLabel: fsStr(f.orderCategoryLabel),
+      });
+    }
+    let pushed = 0;
+    for (const o of fresh) {
+      try {
+        const ok = await sendFcmToTopic(
+          'rider_notifications',
+          `🛵 New Order #${o.id}`,
+          `${o.customerName} • ₹${Math.floor(o.amountValue)} — Tap to Accept`,
+          {
+            orderId: String(o.id),
+            amount: String(Math.floor(o.amountValue)),
+            customerName: o.customerName,
+            address: o.address || '',
+            customerPhone: o.customerPhone || '',
+            items: o.items || '',
+            categoryLabel: o.categoryLabel || '',
+          },
+        );
+        if (ok) pushed++;
+        console.log(ok ? `📲 [WATCH] FCM push sent for ${o.id}` : `⚠️ [WATCH] FCM failed for ${o.id}`);
+      } catch (e) { console.error('[WATCH] push notice:', e.message); }
+      seen.add(o.id);
+    }
+    // Persist seen IDs (cap 500) so replays never double-ring
+    try {
+      const arr = [...seen].slice(-500);
+      await upstashCommand(['SET', WATCHED_KEY, JSON.stringify(arr), 'EX', '86400']);
+    } catch (_) {}
+    res.json({ success: true, checked: docs.length, pushed, fresh: fresh.map((o) => o.id) });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
 
 // ─── Direct-token FCM (WhatsApp-style incoming-call ring) ─────────────────────
 // Sends a high-priority data+notification push to ONE device token.
@@ -262,6 +388,108 @@ app.get('/', async (req, res) => {
     completedOrders: orders.filter(o => o.stage >= 1).length,
     timestamp: new Date().toISOString()
   });
+});
+
+// ─── DIAGNOSTIC: test-push (proves FCM topic → phone path) ─────────────────
+// GET /api/diag/test-push — sends a test notification to rider_notifications.
+// If the rider phone shows it (foreground/background/killed), the ENTIRE
+// FCM chain works and the problem is order-specific. If NOTHING shows even
+// with the rider app OPEN, the phone is unsubscribed or FCM-blocked.
+// Safe: clearly labeled TEST, no order side-effects.
+app.get('/api/diag/test-push', async (req, res) => {
+  try {
+    const ok = await sendFcmToTopic(
+      'rider_notifications',
+      '🧪 TEST — Food Mela Push Check',
+      'Agar yeh dikha toh FCM chain OK hai. Time: ' + new Date().toISOString(),
+      { type: 'new_order', orderId: 'TEST-PUSH', amount: '0', test: '1' },
+    );
+    console.log(ok ? '🧪 TEST push sent' : '⚠️ TEST push failed');
+    res.json({ success: true, pushed: ok });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADMIN: RIDER PASSWORD RESET (Firebase Auth password set by admin)
+// ═══════════════════════════════════════════════════════════════════════════════
+// WHY: the web client SDK cannot change ANOTHER user's password — only a
+// server with the Admin SDK can. The admin panel calls this with its own
+// Firebase ID token; the backend verifies the caller is an admin, then
+// creates-or-updates the rider's Auth password. Never logs or stores it.
+// Env: reuses FCM_SERVICE_ACCOUNT (same Firebase project service account).
+let _adminApp = null;
+function adminAuth() {
+  try {
+    if (_adminApp) return _adminApp.auth();
+    const sa = fcmServiceAccount();
+    if (!sa || !sa.private_key || !sa.client_email || !sa.project_id) return null;
+    const admin = require('firebase-admin');
+    _adminApp = admin.apps.length
+      ? admin.app()
+      : admin.initializeApp({ credential: admin.credential.cert(sa), projectId: sa.project_id });
+    return _adminApp.auth();
+  } catch (e) {
+    console.error('adminAuth init notice:', e.message);
+    return null;
+  }
+}
+async function isAdminCaller(idToken) {
+  try {
+    const authAdmin = adminAuth();
+    if (!authAdmin || !idToken) return false;
+    const decoded = await authAdmin.verifyIdToken(idToken);
+    if ((decoded.email || '').toLowerCase() === 'admin@foodmela.com') return true;
+    // Role check: users/{uid} must have role == 'admin'
+    const project = process.env.FIRESTORE_PROJECT_ID || 'food-mela-notification';
+    const docPath = `/v1/projects/${project}/databases/(default)/documents/users/${decoded.uid}`;
+    const resp = await new Promise((resolve) => {
+      const r = https.request({ hostname: 'firestore.googleapis.com', path: docPath, method: 'GET' }, (rs) => {
+        let d = '';
+        rs.on('data', (c) => { d += c; });
+        rs.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
+      });
+      r.on('error', () => resolve(null));
+      r.setTimeout(10000, () => { r.destroy(); resolve(null); });
+      r.end();
+    });
+    return resp?.fields?.role?.stringValue === 'admin';
+  } catch (_) { return false; }
+}
+
+app.post('/api/admin/riders/reset-password', async (req, res) => {
+  try {
+    const authHeader = String(req.headers.authorization || '');
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (!(await isAdminCaller(idToken))) {
+      return res.status(403).json({ success: false, error: 'admin only' });
+    }
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const newPassword = String(req.body.newPassword || '');
+    if (!email.includes('@')) return res.status(400).json({ success: false, error: 'valid email required' });
+    if (newPassword.length < 6) return res.status(400).json({ success: false, error: 'password must be at least 6 characters' });
+    const authAdmin = adminAuth();
+    if (!authAdmin) return res.status(500).json({ success: false, error: 'auth service not configured' });
+
+    let uid;
+    try {
+      const existing = await authAdmin.getUserByEmail(email);
+      uid = existing.uid;
+      await authAdmin.updateUser(uid, { password: newPassword });
+    } catch (e) {
+      if (e.code === 'auth/user-not-found') {
+        const created = await authAdmin.createUser({ email, password: newPassword });
+        uid = created.uid;
+      } else {
+        throw e;
+      }
+    }
+    res.json({ success: true, uid });
+  } catch (e) {
+    console.error('reset-password notice:', e.message);
+    res.status(500).json({ success: false, error: 'reset failed' });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
