@@ -351,7 +351,7 @@ function registerCallRoutes(app, { readOrders }) {
     try {
       const logs = await readCallLogs();
       const list = logs.filter((l) => l.orderId === req.params.orderId);
-      res.json({ success: true, orderId: req.params.orderId, count: list.length, logs: list });
+      res.json({ success: true, orderId: req.params.orderId, count: list.length, logs: list.map(withPlaybackUrl) });
     } catch (e) {
       res.status(500).json({ success: false, error: e.message });
     }
@@ -368,11 +368,92 @@ function registerCallRoutes(app, { readOrders }) {
       if (status) list = list.filter((l) => String(l.status) === String(status));
       const n = Math.min(Math.max(parseInt(String(limit || '100'), 10) || 100, 1), 500);
       list = list.slice(0, n);
-      res.json({ success: true, count: list.length, total: logs.length, logs: list });
+      // Attach a backend-proxied playback URL — the GCS bucket is private
+      // (public reads 403), so browsers play via this endpoint instead.
+      res.json({ success: true, count: list.length, total: logs.length, logs: list.map(withPlaybackUrl) });
     } catch (e) {
       res.status(500).json({ success: false, error: e.message });
     }
   });
+
+  // ── ✨ GET /api/admin/call-recordings/play?object=<name> — signed playback ──
+  // The GCS bucket denies public reads, so the admin <audio> player cannot
+  // use the public URL. This endpoint mints a short-lived HMAC-signed URL
+  // (AWS Signature V4, GCS interop) that the browser streams directly.
+  // No API shape change — additive. Query: ?object=call_recordings/FM-1/….mp3
+  app.get('/api/admin/call-recordings/play', async (req, res) => {
+    try {
+      const objectName = String(req.query.object || '');
+      if (!objectName || objectName.includes('..') || objectName.startsWith('/')) {
+        return res.status(400).json({ success: false, error: 'bad object name' });
+      }
+      if (!REC_BUCKET || !REC_KEY || !REC_SECRET) {
+        return res.status(500).json({ success: false, error: 'recording storage keys missing' });
+      }
+      const url = signGcsUrl(REC_BUCKET, objectName, REC_KEY, REC_SECRET, 900);
+      res.json({ success: true, url });
+    } catch (e) {
+      res.status(500).json({ success: false, error: e.message });
+    }
+  });
+}
+
+// ─── Playback URL helpers ───────────────────────────────────────────────────
+// The GCS bucket is private, so the public recordingUrl 403s in browsers.
+// The admin player calls /api/admin/call-recordings/play?object=<name> to get
+// a short-lived signed URL. These helpers extract the object name and expose
+// the play endpoint path on each log (additive — recordingUrl untouched).
+function objectNameFor(recordingUrl) {
+  try {
+    if (!recordingUrl || typeof recordingUrl !== 'string') return null;
+    const u = new URL(recordingUrl);
+    if (u.hostname !== 'storage.googleapis.com') return null;
+    const parts = u.pathname.split('/').filter(Boolean);
+    if (parts.length < 2) return null;
+    return parts.slice(1).join('/');
+  } catch {
+    return null;
+  }
+}
+
+function withPlaybackUrl(log) {
+  const objectName = objectNameFor(log.recordingUrl);
+  return objectName
+    ? { ...log, playbackUrl: `/api/admin/call-recordings/play?object=${encodeURIComponent(objectName)}` }
+    : log;
+}
+
+// ─── GCS HMAC signed URL (AWS Signature V4, interop keys) ──────────────────
+// Lets the browser stream a private-bucket object directly for `expiresIn`
+// seconds without exposing any secret. Pure crypto, no dependency.
+function signGcsUrl(bucket, objectName, accessKey, secretKey, expiresIn) {
+  const crypto = require('crypto');
+  const host = 'storage.googleapis.com';
+  const uriPath = `/${bucket}/${objectName}`;
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+  const dateStamp = amzDate.slice(0, 8);
+  const scope = `${dateStamp}/auto/storage/goog4_request`;
+  const params = {
+    'X-Goog-Algorithm': 'GOOG4-HMAC-SHA256',
+    'X-Goog-Credential': `${accessKey}/${scope}`,
+    'X-Goog-Date': amzDate,
+    'X-Goog-Expires': String(expiresIn),
+    'X-Goog-SignedHeaders': 'host',
+  };
+  const canonicalQuery = Object.keys(params)
+    .sort()
+    .map((k) => `${k}=${encodeURIComponent(params[k])}`)
+    .join('&');
+  const canonicalRequest = [
+    'GET', uriPath, canonicalQuery, `host:${host}`, '', 'host', 'UNSIGNED-PAYLOAD',
+  ].join('\n');
+  const hash = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
+  const hmac = (key, s) => crypto.createHmac('sha256', key).update(s, 'utf8').digest();
+  const stringToSign = ['GOOG4-HMAC-SHA256', amzDate, scope, hash(canonicalRequest)].join('\n');
+  const signingKey = hmac(hmac(hmac(hmac(`GOOG4${secretKey}`, dateStamp), 'auto'), 'storage'), 'goog4_request');
+  const signature = crypto.createHmac('sha256', signingKey).update(stringToSign, 'utf8').digest('hex');
+  return `https://${host}${uriPath}?${canonicalQuery}&X-Goog-Signature=${signature}`;
 }
 
 module.exports = { registerCallRoutes, channelFor, userIdToUid };
