@@ -18,6 +18,7 @@ if (!UPSTASH_TOKEN) console.warn('⚠️ UPSTASH_TOKEN missing — set it in .en
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const ORDERS_KEY    = 'fm_orders_v1';
 
@@ -776,6 +777,264 @@ const placeOrderHandler = async (req, res) => {
 
 app.post('/api/orders/place', placeOrderHandler);
 app.post('/api/orders/create', placeOrderHandler);
+
+// ─── PAYTM PAYMENT GATEWAY INTEGRATION ────────────────────────────────────────
+const PaytmChecksum = require('paytmchecksum');
+const PAYTM_MID = process.env.PAYTM_MID || 'mpqYbj50421905800434';
+const PAYTM_MERCHANT_KEY = process.env.PAYTM_MERCHANT_KEY || '%#ZWYa2coc4seWvK';
+const PAYTM_ENV = process.env.PAYTM_ENV || 'staging'; // 'staging' or 'production'
+const PAYTM_HOST = PAYTM_ENV === 'production' ? 'securegw.paytm.in' : 'securegw-stage.paytm.in';
+const PAYTM_WEBSITE = process.env.PAYTM_WEBSITE || (PAYTM_ENV === 'production' ? 'DEFAULT' : 'WEBSTAGING');
+
+async function saveDraftOrder(orderId, draftData) {
+  try {
+    await upstashCommand(['SET', `fm_draft_order:${orderId}`, JSON.stringify(draftData), 'EX', '3600']);
+  } catch (e) {
+    console.error('Save draft error:', e.message);
+  }
+}
+
+async function getDraftOrder(orderId) {
+  try {
+    const res = await upstashCommand(['GET', `fm_draft_order:${orderId}`]);
+    if (res.result && res.result !== 'nil' && res.result !== null) {
+      return JSON.parse(res.result);
+    }
+  } catch (e) {
+    console.error('Get draft error:', e.message);
+  }
+  return null;
+}
+
+// 1. INITIATE TRANSACTION – Generates Paytm txnToken
+app.post('/api/paytm/initiate', async (req, res) => {
+  try {
+    const { customerName, phone, address, items, totalAmount } = req.body || {};
+    const amountNum = Number(totalAmount || 0);
+    if (!amountNum || amountNum <= 0) {
+      return res.status(400).json({ success: false, error: 'Valid totalAmount required' });
+    }
+
+    const orderId = req.body.orderId || `FM-${Date.now().toString().slice(-6)}`;
+    const amtStr = amountNum.toFixed(2);
+
+    // Save draft order to Redis for automated reconstruction on callback
+    const draftData = {
+      orderId,
+      customerName: customerName || 'Customer',
+      phone: phone || 'unknown',
+      address: address || 'Birmaharajpur',
+      items: items || 'Food items',
+      totalAmount: amountNum,
+      total: `₹${Math.floor(amountNum)}`,
+      createdAt: new Date().toISOString(),
+    };
+    await saveDraftOrder(orderId, draftData);
+
+    const callbackUrl = process.env.PAYTM_CALLBACK_URL || 'https://foodmela.online/api/paytm/callback';
+
+    const paytmParams = {
+      body: {
+        requestType: 'Payment',
+        mid: PAYTM_MID,
+        websiteName: PAYTM_WEBSITE,
+        orderId: orderId,
+        callbackUrl: callbackUrl,
+        txnAmount: {
+          value: amtStr,
+          currency: 'INR',
+        },
+        userInfo: {
+          custId: phone ? `CUST_${String(phone).replace(/[^0-9]/g, '')}` : 'CUST_FOODMELA',
+        },
+      }
+    };
+
+    const checksum = await PaytmChecksum.generateSignature(JSON.stringify(paytmParams.body), PAYTM_MERCHANT_KEY);
+    paytmParams.head = { signature: checksum };
+
+    const postData = JSON.stringify(paytmParams);
+
+    const paytmReq = https.request({
+      hostname: PAYTM_HOST,
+      port: 443,
+      path: `/theia/api/v1/initiateTransaction?mid=${PAYTM_MID}&orderId=${orderId}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData)
+      }
+    }, (paytmRes) => {
+      let data = '';
+      paytmRes.on('data', chunk => data += chunk);
+      paytmRes.on('end', () => {
+        try {
+          const resp = JSON.parse(data);
+          const txnToken = resp.body?.txnToken;
+          if (txnToken) {
+            return res.json({
+              success: true,
+              orderId,
+              txnToken,
+              amount: amtStr,
+              mid: PAYTM_MID,
+              host: PAYTM_HOST,
+              env: PAYTM_ENV,
+            });
+          } else {
+            console.warn('Paytm initiate response:', resp.body?.resultInfo);
+            return res.json({
+              success: false,
+              orderId,
+              mid: PAYTM_MID,
+              amount: amtStr,
+              error: resp.body?.resultInfo?.resultMsg || 'Paytm gateway pending activation',
+              code: resp.body?.resultInfo?.resultCode,
+            });
+          }
+        } catch (err) {
+          return res.status(500).json({ success: false, error: 'Invalid response from Paytm gateway' });
+        }
+      });
+    });
+
+    paytmReq.on('error', (e) => {
+      console.error('Paytm request error:', e);
+      res.status(500).json({ success: false, error: e.message });
+    });
+
+    paytmReq.write(postData);
+    paytmReq.end();
+  } catch (err) {
+    console.error('Paytm initiate exception:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 2. S2S CALLBACK – Automated Payment Verification & Order Placement
+app.post('/api/paytm/callback', async (req, res) => {
+  try {
+    const callbackData = req.body || {};
+    const orderId = callbackData.ORDERID;
+    const status = callbackData.STATUS;
+    const txnId = callbackData.TXNID || '';
+    const checksum = callbackData.CHECKSUMHASH || '';
+
+    console.log(`🔔 Paytm Callback Received: ${orderId} -> STATUS: ${status}, RESPMSG: ${callbackData.RESPMSG}`);
+
+    if (!orderId) {
+      return res.redirect(303, 'https://foodmela.online/?payment_error=Missing%20Order%20ID');
+    }
+
+    let isSignatureValid = false;
+    try {
+      const paramsToVerify = { ...callbackData };
+      delete paramsToVerify.CHECKSUMHASH;
+      isSignatureValid = PaytmChecksum.verifySignature(paramsToVerify, PAYTM_MERCHANT_KEY, checksum);
+    } catch (_) {
+      isSignatureValid = false;
+    }
+
+    if (status === 'TXN_SUCCESS') {
+      const draft = await getDraftOrder(orderId);
+      const orders = await readOrders();
+      let existing = orders.find(o => o.id === orderId);
+
+      if (!existing) {
+        const customerName = draft?.customerName || callbackData.MERC_UNQ_REF || 'Customer';
+        const phone = draft?.phone || 'unknown';
+        const address = draft?.address || 'Birmaharajpur';
+        const items = draft?.items || 'Food items';
+        const totalAmount = draft?.totalAmount || Number(callbackData.TXNAMOUNT || 0);
+
+        const newOrder = {
+          id: orderId,
+          customerName,
+          phone,
+          address: `${address} [PREPAID - PAID ONLINE (Paytm Txn: ${txnId})]`,
+          items,
+          total: `₹${Math.floor(totalAmount)}`,
+          amountValue: totalAmount,
+          stage: 0,
+          status: 'Order Placed & Waiting for Delivery Boy 📝🍳',
+          paymentMode: 'PREPAID',
+          paymentStatus: 'PAID',
+          paytmTxnId: txnId,
+          acceptedBy: null,
+          acceptedByName: null,
+          deliveryOtp: String(1000 + Math.floor(Math.random() * 9000)),
+          timestamp: new Date().toISOString(),
+          placedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+
+        orders.unshift(newOrder);
+        await writeOrders(orders);
+
+        if (phone && phone !== 'unknown') {
+          const user = await readUser(phone);
+          if (!user.orderHistory) user.orderHistory = [];
+          user.orderHistory.unshift({ ...newOrder, orderStatus: 'placed' });
+          if (user.orderHistory.length > 50) user.orderHistory = user.orderHistory.slice(0, 50);
+          await writeUser(phone, user);
+        }
+
+        console.log(`✅ AUTOMATIC PAID ORDER CREATED: ${orderId} by ${customerName} (₹${totalAmount}) via Txn: ${txnId}`);
+        pushNewOrderToRiders(newOrder);
+      }
+
+      return res.redirect(303, `https://foodmela.online/track/${encodeURIComponent(orderId)}?paid=1`);
+    } else {
+      console.warn(`❌ Paytm Payment Not Successful: ${orderId} (${callbackData.RESPMSG})`);
+      return res.redirect(303, `https://foodmela.online/?payment_error=${encodeURIComponent(callbackData.RESPMSG || 'Payment Failed')}&orderId=${encodeURIComponent(orderId)}`);
+    }
+  } catch (err) {
+    console.error('Paytm callback exception:', err);
+    return res.redirect(303, 'https://foodmela.online/?payment_error=Callback%20processing%20error');
+  }
+});
+
+// 3. TRANSACTION STATUS CHECK
+app.get('/api/paytm/status/:orderId', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const paytmParams = {
+      body: {
+        mid: PAYTM_MID,
+        orderId: orderId,
+      }
+    };
+    const checksum = await PaytmChecksum.generateSignature(JSON.stringify(paytmParams.body), PAYTM_MERCHANT_KEY);
+    paytmParams.head = { signature: checksum };
+
+    const postData = JSON.stringify(paytmParams);
+    const paytmReq = https.request({
+      hostname: PAYTM_HOST,
+      port: 443,
+      path: '/v3/order/status',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData)
+      }
+    }, (paytmRes) => {
+      let data = '';
+      paytmRes.on('data', chunk => data += chunk);
+      paytmRes.on('end', () => {
+        try {
+          res.json(JSON.parse(data));
+        } catch (_) {
+          res.status(500).json({ success: false, error: 'Failed parsing status' });
+        }
+      });
+    });
+    paytmReq.on('error', e => res.status(500).json({ success: false, error: e.message }));
+    paytmReq.write(postData);
+    paytmReq.end();
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
 
 // ✅ ACCEPT ORDER – first driver to accept wins; enforces blocking/approval
 app.post('/api/orders/accept', async (req, res) => {
