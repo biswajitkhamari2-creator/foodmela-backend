@@ -257,7 +257,11 @@ function registerCallRoutes(app, { readOrders }) {
           cname: channel, uid: String(RECORD_UID),
           clientRequest: {
             token: recToken,
-            recordingFileConfig: { avFileType: ['mp3'] },
+            // Mix mode accepts hls ONLY — mp3/mp4 (alone or combined)
+            // are rejected ("not supported by mix mode"). HLS outputs an
+            // .m3u8 playlist + .ts segments (audio-only call → audio
+            // segments), playable in the admin player. Verified 2026-09-15.
+            recordingFileConfig: { avFileType: ['hls'] },
             storageConfig: {
               vendor: 6, region: 0, bucket: REC_BUCKET,
               accessKey: REC_KEY, secretKey: REC_SECRET,
@@ -289,9 +293,18 @@ function registerCallRoutes(app, { readOrders }) {
           const out = await agoraRest(
             `/v1/apps/${AGORA_APP_ID}/cloud_recording/resourceid/${log.agoraResourceId}/sid/${log.agoraSid}/mode/mix/stop`,
             'POST', { cname: log.channelName, uid: String(RECORD_UID), clientRequest: {} });
-          const file = out?.serverResponse?.fileList?.[0];
-          const name = typeof file === 'string' ? file : file?.fileName;
+          let name = pickRecordingFile(out?.serverResponse?.fileList);
+          // Fallback: stop response may omit the list — query Agora directly.
+          if (!name) {
+            try {
+              const q = await agoraRest(
+                `/v1/apps/${AGORA_APP_ID}/cloud_recording/resourceid/${log.agoraResourceId}/sid/${log.agoraSid}/mode/mix/query`,
+                'GET', null);
+              name = pickRecordingFile(q?.serverResponse?.fileList);
+            } catch (qe) { console.error('recording query notice:', qe.message); }
+          }
           if (name) log.recordingUrl = recordingPublicUrl(name);
+          else console.error('recording stop: no file found for', log.id);
         } catch (e) { console.error('recording stop notice:', e.message); }
       }
       log.status = 'ended';
@@ -328,16 +341,13 @@ function registerCallRoutes(app, { readOrders }) {
   app.post('/api/calls/recording/webhook', async (req, res) => {
     try {
       const { sid, fileList } = req.body || {};
-      if (sid && Array.isArray(fileList) && fileList.length) {
-        const f = fileList[0];
-        const name = typeof f === 'string' ? f : f.fileName;
-        if (name && REC_BUCKET) {
-          const logs = await readCallLogs();
-          const log = logs.find((l) => l.agoraSid === sid);
-          if (log) {
-            log.recordingUrl = recordingPublicUrl(name);
-            await writeCallLogs(logs);
-          }
+      const name = pickRecordingFile(fileList);
+      if (sid && name && REC_BUCKET) {
+        const logs = await readCallLogs();
+        const log = logs.find((l) => l.agoraSid === sid);
+        if (log) {
+          log.recordingUrl = recordingPublicUrl(name);
+          await writeCallLogs(logs);
         }
       }
       res.json({ success: true });
@@ -376,6 +386,32 @@ function registerCallRoutes(app, { readOrders }) {
     }
   });
 
+  // ── ✨ POST /api/admin/call-logs/:callId/repair — re-fetch recording URL ──
+  // For logs whose recordingUrl is missing/broken (e.g. the `.../c` bug):
+  // re-queries Agora with the saved resourceId+sid and repairs the URL.
+  // Body: {} — uses the stored log. Returns the repaired log.
+  app.post('/api/admin/call-logs/:callId/repair', async (req, res) => {
+    try {
+      if (!AGORA_CUST_KEY) return res.status(500).json({ success: false, error: 'AGORA_CUSTOMER_KEY missing' });
+      const logs = await readCallLogs();
+      const log = logs.find((l) => l.id === req.params.callId);
+      if (!log) return res.status(404).json({ success: false, error: 'Call not found' });
+      if (!log.agoraResourceId || !log.agoraSid) {
+        return res.status(409).json({ success: false, error: 'No Agora session saved for this call' });
+      }
+      const q = await agoraRest(
+        `/v1/apps/${AGORA_APP_ID}/cloud_recording/resourceid/${log.agoraResourceId}/sid/${log.agoraSid}/mode/mix/query`,
+        'GET', null);
+      const name = pickRecordingFile(q?.serverResponse?.fileList);
+      if (!name) return res.status(404).json({ success: false, error: 'Agora has no file for this session yet' });
+      log.recordingUrl = recordingPublicUrl(name);
+      await writeCallLogs(logs);
+      res.json({ success: true, log: withPlaybackUrl(log) });
+    } catch (e) {
+      res.status(500).json({ success: false, error: e.message });
+    }
+  });
+
   // ── ✨ GET /api/admin/call-recordings/play?object=<name> — signed playback ──
   // The GCS bucket denies public reads, so the admin <audio> player cannot
   // use the public URL. This endpoint mints a short-lived HMAC-signed URL
@@ -396,6 +432,29 @@ function registerCallRoutes(app, { readOrders }) {
       res.status(500).json({ success: false, error: e.message });
     }
   });
+}
+
+// ─── Recording file picker ──────────────────────────────────────────────────
+// Agora's stop response / webhook `fileList` varies in shape:
+//   • array of {fileName} objects  → [{fileName: 'call_recordings/….m3u8'}, …]
+//   • array of strings             → ['call_recordings/….m3u8', …]
+//   • single string (NOT an array) → 'call_recordings/….m3u8'
+//   • single {fileName} object     → {fileName: '…'}
+// Naive `fileList[0]` on a STRING returns its first CHARACTER ('c') —
+// that is exactly how broken `.../c` recording URLs were saved.
+// This picker normalizes every shape and prefers the .m3u8 playlist
+// (HLS mode output) over .ts segments.
+function pickRecordingFile(fileList) {
+  if (!fileList) return null;
+  const names = [];
+  const push = (f) => {
+    const n = typeof f === 'string' ? f : f && f.fileName;
+    if (typeof n === 'string' && n.length > 4) names.push(n);
+  };
+  if (Array.isArray(fileList)) fileList.forEach(push);
+  else push(fileList);
+  if (!names.length) return null;
+  return names.find((n) => n.endsWith('.m3u8')) || names.find((n) => n.endsWith('.mp3')) || names.find((n) => n.endsWith('.mp4')) || names[0];
 }
 
 // ─── Playback URL helpers ───────────────────────────────────────────────────
