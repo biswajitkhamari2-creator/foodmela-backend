@@ -167,8 +167,19 @@ function orderIsActive(order) {
 }
 
 // ─── Route registration ─────────────────────────────────────────────────────
-function registerCallRoutes(app, { readOrders }) {
+// verifyApiToken is injected from server.js (same HMAC session tokens).
+function registerCallRoutes(app, { readOrders, verifyApiToken }) {
+  const viewerOf = (req) => {
+    try {
+      const h = String(req.headers.authorization || '');
+      const t = h.startsWith('Bearer ') ? h.slice(7).trim()
+        : String(req.body?.apiToken || req.query?.apiToken || '').trim();
+      return (verifyApiToken && t ? verifyApiToken(t) : null);
+    } catch (_) { return null; }
+  };
   // ── POST /api/calls/:orderId/token { userId, role? } ──
+  // userId must MATCH the verified token phone (was fully spoofable:
+  // anyone could mint an Agora voice token for ANY order).
   app.post('/api/calls/:orderId/token', async (req, res) => {
     try {
       if (!RtcTokenBuilder) return res.status(501).json({ success: false, error: 'agora-access-token not installed — run npm install' });
@@ -176,6 +187,15 @@ function registerCallRoutes(app, { readOrders }) {
       const { orderId } = req.params;
       const { userId, role } = req.body || {};
       if (!userId) return res.status(400).json({ success: false, error: 'userId required (customer phone or riderId)' });
+      const viewer = viewerOf(req);
+      if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
+      const claimed = String(userId);
+      const claimedNorm = normPhone(claimed);
+      const viewerNorm = normPhone(viewer.phone);
+      const samePerson = claimed === viewer.phone || (claimedNorm.length >= 10 && claimedNorm === viewerNorm);
+      if (!samePerson && viewer.role !== 'admin') {
+        return res.status(403).json({ success: false, error: 'userId must be your own number' });
+      }
 
       const order = await findOrder(orderId, readOrders);
       if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
@@ -199,11 +219,19 @@ function registerCallRoutes(app, { readOrders }) {
   });
 
   // ── POST /api/calls/:orderId/request { callerId, callerRole?, receiverId? } ──
+  // callerId must match the verified token phone (was spoofable).
   app.post('/api/calls/:orderId/request', async (req, res) => {
     try {
       const { orderId } = req.params;
       const { callerId, callerRole, receiverId } = req.body || {};
       if (!callerId) return res.status(400).json({ success: false, error: 'callerId required' });
+      const viewer = viewerOf(req);
+      if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
+      const claimedNorm = normPhone(String(callerId));
+      const viewerNorm = normPhone(viewer.phone);
+      if (claimedNorm !== viewerNorm && viewer.role !== 'admin') {
+        return res.status(403).json({ success: false, error: 'callerId must be your own number' });
+      }
       const order = await findOrder(orderId, readOrders);
       if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
       if (!orderIsActive(order)) return res.status(403).json({ success: false, error: 'Order is not active' });
@@ -237,9 +265,12 @@ function registerCallRoutes(app, { readOrders }) {
   });
 
   // ── POST /api/calls/:orderId/record/start { callId } ──
+  // Caller must be a member of the order (was open to anyone).
   app.post('/api/calls/:orderId/record/start', async (req, res) => {
     try {
       const { callId } = req.body || {};
+      const viewer = viewerOf(req);
+      if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
       if (!AGORA_CUST_KEY || !AGORA_CUST_SECRET) return res.status(500).json({ success: false, error: 'AGORA_CUSTOMER_KEY/SECRET missing' });
       if (!REC_BUCKET) return res.status(500).json({ success: false, error: 'RECORDING_STORAGE_BUCKET missing — recording disabled' });
       const logs = await readCallLogs();
@@ -284,9 +315,14 @@ function registerCallRoutes(app, { readOrders }) {
   app.post('/api/calls/:orderId/record/stop', async (req, res) => {
     try {
       const { callId, duration = 0 } = req.body || {};
+      const viewer = viewerOf(req);
+      if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
       const logs = await readCallLogs();
       const log = logs.find((l) => l.id === callId);
       if (!log) return res.status(404).json({ success: false, error: 'Call not found' });
+      if (String(log.orderId) !== String(req.params.orderId)) {
+        return res.status(403).json({ success: false, error: 'Call does not belong to this order' });
+      }
 
       if (log.agoraResourceId && log.agoraSid && AGORA_CUST_KEY) {
         try {
@@ -324,9 +360,13 @@ function registerCallRoutes(app, { readOrders }) {
       if (!['rejected', 'missed', 'ended', 'failed'].includes(status)) {
         return res.status(400).json({ success: false, error: 'bad status' });
       }
+      if (!viewerOf(req)) return res.status(401).json({ success: false, error: 'Login required' });
       const logs = await readCallLogs();
       const log = logs.find((l) => l.id === callId);
       if (!log) return res.status(404).json({ success: false, error: 'Call not found' });
+      if (String(log.orderId) !== String(req.params.orderId)) {
+        return res.status(403).json({ success: false, error: 'Call does not belong to this order' });
+      }
       log.status = status;
       if (duration) log.duration = Number(duration);
       log.endedAt = new Date().toISOString();
@@ -357,7 +397,15 @@ function registerCallRoutes(app, { readOrders }) {
   });
 
   // ── ✨ GET /api/admin/orders/:orderId/call-logs ──
-  app.get('/api/admin/orders/:orderId/call-logs', async (req, res) => {
+  // ADMIN TOKEN ONLY (was fully open — anyone could dump all call metadata).
+  const requireAdminToken = (req, res, next) => {
+    const v = viewerOf(req);
+    if (!v || v.role !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Admin only' });
+    }
+    next();
+  };
+  app.get('/api/admin/orders/:orderId/call-logs', requireAdminToken, async (req, res) => {
     try {
       const logs = await readCallLogs();
       const list = logs.filter((l) => l.orderId === req.params.orderId);
@@ -369,7 +417,7 @@ function registerCallRoutes(app, { readOrders }) {
 
   // ── ✨ GET /api/admin/call-logs — ALL calls for the admin recordings tab ──
   // Query: ?orderId=FM-123 (filter), ?status=ended (filter), ?limit=100 (default 100, max 500)
-  app.get('/api/admin/call-logs', async (req, res) => {
+  app.get('/api/admin/call-logs', requireAdminToken, async (req, res) => {
     try {
       const logs = await readCallLogs();
       let list = logs;
@@ -390,7 +438,7 @@ function registerCallRoutes(app, { readOrders }) {
   // For logs whose recordingUrl is missing/broken (e.g. the `.../c` bug):
   // re-queries Agora with the saved resourceId+sid and repairs the URL.
   // Body: {} — uses the stored log. Returns the repaired log.
-  app.post('/api/admin/call-logs/:callId/repair', async (req, res) => {
+  app.post('/api/admin/call-logs/:callId/repair', requireAdminToken, async (req, res) => {
     try {
       if (!AGORA_CUST_KEY) return res.status(500).json({ success: false, error: 'AGORA_CUSTOMER_KEY missing' });
       const logs = await readCallLogs();
