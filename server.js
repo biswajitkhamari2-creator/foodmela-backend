@@ -695,7 +695,14 @@ app.post('/api/auth/rider/token', async (req, res) => {
     if (blocked) return res.status(403).json({ success: false, error: 'Account is blocked' });
     if (approval !== 'approved') return res.status(403).json({ success: false, error: 'Account awaiting approval' });
     if (phone.length < 10) return res.status(403).json({ success: false, error: 'No phone linked to rider account' });
-    res.json({ success: true, apiToken: mintApiToken(phone, 'rider'), phone });
+    // Firestore custom token so the rider app passes the hardened rules
+    // (isRider checks users/{uid} role). uid = Firebase Auth uid.
+    let firebaseToken = null;
+    try {
+      const authAdmin2 = adminAuth();
+      if (authAdmin2) firebaseToken = await authAdmin2.createCustomToken(decoded.uid, { role: 'rider', phone_number: phone });
+    } catch (e) { console.error('rider custom token notice:', e.message); }
+    res.json({ success: true, apiToken: mintApiToken(phone, 'rider'), phone, firebaseToken });
   } catch (e) {
     res.status(500).json({ success: false, error: 'token mint failed' });
   }
