@@ -79,10 +79,34 @@ function rateLimit({ windowMs, max, prefix }) {
 }
 const limitApi = rateLimit({ windowMs: 60 * 1000, max: 120, prefix: 'api' });
 const limitAuth = rateLimit({ windowMs: 60 * 1000, max: 20, prefix: 'auth' });
+// BOT BLOCK: OTP verify is the signup gate — 1 phone = 1 human. Bots hammer
+// this endpoint to mint sessions for fake numbers, so it gets its own tight
+// per-IP bucket (5/min) PLUS a per-phone cooldown below (1 verify / 2 min).
+const limitOtpVerify = rateLimit({ windowMs: 60 * 1000, max: 5, prefix: 'otp' });
 app.use('/api/', limitApi);
 app.use('/api/auth/', limitAuth);
 app.use('/api/admin/', limitAuth);
+app.use('/api/auth/phone-email/verify', limitOtpVerify);
 app.use('/api/payu/initiate', rateLimit({ windowMs: 60 * 1000, max: 30, prefix: 'payu' }));
+// Per-phone OTP cooldown: phone → last successful verify timestamp (2 min).
+// In-memory + serverless-safe (each instance throttles independently — a bot
+// hitting many instances still faces the per-IP bucket on every instance).
+const _otpPhoneCool = new Map();
+function otpPhoneAllowed(phone) {
+  try {
+    const now = Date.now();
+    const last = _otpPhoneCool.get(phone) || 0;
+    if (now - last < 2 * 60 * 1000) return false;
+    _otpPhoneCool.set(phone, now);
+    if (_otpPhoneCool.size > 5000) {
+      for (const [k, v] of _otpPhoneCool) {
+        if (now - v > 2 * 60 * 1000) _otpPhoneCool.delete(k);
+        if (_otpPhoneCool.size <= 4000) break;
+      }
+    }
+    return true;
+  } catch (_) { return true; }
+}
 
 const ORDERS_KEY    = 'fm_orders_v1';
 
@@ -864,6 +888,10 @@ app.post('/api/auth/phone-email/verify', async (req, res) => {
       if (phone.length < 10) {
         return res.status(401).json({ success: false, error: 'verification failed' });
       }
+      if (!otpPhoneAllowed(phone)) {
+        res.setHeader('Retry-After', '120');
+        return res.status(429).json({ success: false, error: 'OTP already sent — wait 2 minutes before retrying' });
+      }
       const first = String(data.user_first_name ?? '').trim();
       const last = String(data.user_last_name ?? '').trim();
       const name = `${first} ${last}`.trim();
@@ -886,6 +914,10 @@ app.post('/api/auth/phone-email/verify', async (req, res) => {
     if (data.status !== 200 || phone.length < 10) {
       return res.status(401).json({ success: false, error: 'verification failed' });
     }
+    if (!otpPhoneAllowed(phone)) {
+      res.setHeader('Retry-After', '120');
+      return res.status(429).json({ success: false, error: 'OTP already sent — wait 2 minutes before retrying' });
+    }
     let firebaseToken = null;
     try {
       const authAdmin = adminAuth();
@@ -905,6 +937,15 @@ app.post('/api/user/register', async (req, res) => {
     const raw = String(req.body.phone || '').replace(/[^0-9]/g, '');
     const phone = raw.slice(-10);
     if (phone.length < 10) return res.status(400).json({ success: false, error: 'valid phone required' });
+    // BOT BLOCK: register needs the OTP-minted token for THIS phone — bots
+    // can't create profiles for numbers they never verified.
+    const viewer = viewerFrom(req);
+    if (!viewer || (viewer.role !== 'customer' && viewer.role !== 'admin')) {
+      return res.status(401).json({ success: false, error: 'Verify OTP first' });
+    }
+    if (viewer.role !== 'admin' && viewer.phone !== phone) {
+      return res.status(403).json({ success: false, error: 'Phone must be your own number' });
+    }
     const user = await readUser(phone);
     if (req.body.name) {
       user.name = String(req.body.name).trim();
