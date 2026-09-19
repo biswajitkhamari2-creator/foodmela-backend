@@ -587,6 +587,59 @@ app.get('/api/diag/test-push', async (req, res) => {
 // creates-or-updates the rider's Auth password. Never logs or stores it.
 // Env: reuses FCM_SERVICE_ACCOUNT (same Firebase project service account).
 let _adminApp = null;
+// ─── FIRESTORE MIRROR (app ↔ website live sync) ─────────────────────────────
+// Every website order (COD place-order + PayU callback) is mirrored to the
+// Firestore `orders` collection via the Admin SDK (bypasses rules), so the
+// customer app, rider app, and website track the SAME doc in real time.
+// Best-effort: Redis is the source of truth; a failed mirror never fails
+// the order. Doc shape matches what the apps write (createOrder).
+function adminDb() {
+  try {
+    const sa = fcmServiceAccount();
+    if (!sa || !sa.private_key || !sa.client_email || !sa.project_id) return null;
+    const admin = require('firebase-admin');
+    if (!_adminApp) {
+      _adminApp = admin.apps.length
+        ? admin.app()
+        : admin.initializeApp({ credential: admin.credential.cert(sa), projectId: sa.project_id });
+    }
+    return _adminApp.firestore();
+  } catch (e) {
+    console.error('adminDb init notice:', e.message);
+    return null;
+  }
+}
+function mirrorOrderToFirestore(o) {
+  try {
+    const db = adminDb();
+    if (!db) return;
+    const itemsArr = Array.isArray(o.items) ? o.items : [];
+    const summary = typeof o.items === 'string'
+      ? o.items
+      : itemsArr.map((i) => `${i.quantity || 1}x ${i.name || i.itemId || 'Item'}`).join(', ');
+    db.collection('orders').doc(String(o.id)).set({
+      orderId: String(o.id),
+      customerName: o.customerName || 'Customer',
+      customerPhone: String(o.phone || o.customerPhone || ''),
+      address: o.address || '',
+      items: itemsArr,
+      itemsSummary: summary,
+      totalAmount: Number(o.amountValue ?? o.totalAmount ?? 0),
+      total: o.total || '',
+      status: o.status || 'Order Placed',
+      stage: Number(o.stage ?? 0),
+      riderId: o.acceptedBy ?? null,
+      riderName: o.acceptedByName ?? null,
+      deliveryOtp: String(o.deliveryOtp || ''),
+      createdAt: new Date(o.placedAt || o.timestamp || Date.now()),
+      updatedAt: new Date(),
+      isDeleted: false,
+      source: 'website',
+    }, { merge: true }).catch((e) => console.error('mirror notice:', e.message));
+  } catch (e) {
+    console.error('mirror notice:', e.message);
+  }
+}
 function adminAuth() {
   try {
     if (_adminApp) return _adminApp.auth();
@@ -1031,6 +1084,7 @@ const placeOrderHandler = async (req, res) => {
 
     console.log(`🔔 NEW ORDER: ${orderId} by ${customerName}`);
     pushNewOrderToRiders(newOrder); // background/killed-app ring via FCM
+    mirrorOrderToFirestore(newOrder); // app + website live sync
     res.status(201).json({ success: true, order: newOrder });
   } catch (e) {
     console.error('Place order error:', e);
@@ -1211,6 +1265,7 @@ app.post('/api/payu/callback', async (req, res) => {
 
         console.log(`✅ AUTOMATIC PAID ORDER CREATED: ${txnid} by ${customerName} (₹${totalAmount}) via PayU: ${payuMoneyId}`);
         pushNewOrderToRiders(newOrder);
+        mirrorOrderToFirestore(newOrder); // app + website live sync
       }
 
       return res.redirect(303, `https://foodmela.online/track/${encodeURIComponent(txnid)}?paid=1`);
