@@ -1846,10 +1846,11 @@ app.get('/api/payu/status/:txnid', async (req, res) => {
 // blocking/approval enforced via Upstash user record.
 app.post('/api/orders/accept', requireRider, async (req, res) => {
   try {
-    const { orderId } = req.body;
+    const rawOrderId = String(req.body.orderId || '').trim();
     const driverId = req.apiAuth.phone;
     const driverName = String(req.body.driverName || '').slice(0, 60) || 'Delivery Partner';
-    if (!orderId) return res.status(400).json({ success: false, error: 'orderId required' });
+    if (!rawOrderId) return res.status(400).json({ success: false, error: 'orderId required' });
+    const orderId = rawOrderId.startsWith('FM-') ? rawOrderId : `FM-${rawOrderId.replace(/^FM/i, '')}`;
 
     // ── Enforce partner blocking/approval via Upstash user record ──────────
     if (driverId) {
@@ -1882,14 +1883,17 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
     }
 
     const orders = await readOrders();
-    let idx = orders.findIndex(o => o.id === orderId || o.orderId === orderId);
+    let idx = orders.findIndex(o => o.id === rawOrderId || o.orderId === rawOrderId || o.id === orderId || o.orderId === orderId);
     let fsOrder = null;
 
     if (idx === -1) {
       try {
         const db = adminDb();
         if (db) {
-          const snap = await db.collection('orders').doc(orderId).get();
+          let snap = await db.collection('orders').doc(rawOrderId).get();
+          if (!snap.exists && rawOrderId !== orderId) {
+            snap = await db.collection('orders').doc(orderId).get();
+          }
           if (snap.exists) fsOrder = snap.data();
         }
       } catch (e) { console.error('accept fs lookup error:', e.message); }
@@ -1929,7 +1933,7 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
     try {
       const db = adminDb();
       if (db) {
-        await db.collection('orders').doc(String(orderId)).set({
+        await db.collection('orders').doc(orderId).set({
           stage: 1,
           status: 'Order Accepted ✅',
           riderName: driverName || 'Delivery Partner',
@@ -1960,8 +1964,9 @@ app.post('/api/orders/cancel', async (req, res) => {
   try {
     const viewer = viewerFrom(req);
     if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
-    const { orderId } = req.body;
-    if (!orderId) return res.status(400).json({ success: false, error: 'orderId required' });
+    const rawOrderId = String(req.body.orderId || '').trim();
+    if (!rawOrderId) return res.status(400).json({ success: false, error: 'orderId required' });
+    const orderId = rawOrderId.startsWith('FM-') ? rawOrderId : `FM-${rawOrderId.replace(/^FM/i, '')}`;
 
     const orders = await readOrders();
     let idx = orders.findIndex(o => o.id === orderId || o.orderId === orderId);
@@ -1970,8 +1975,12 @@ app.post('/api/orders/cancel', async (req, res) => {
       try {
         const db = adminDb();
         if (db) {
-          const snap = await db.collection('orders').doc(String(orderId)).get();
-          if (snap.exists) fsData = snap.data();
+          const rawSnap = await db.collection('orders').doc(rawOrderId).get();
+          if (rawSnap.exists) fsData = rawSnap.data();
+          else if (rawOrderId !== orderId) {
+            const normSnap = await db.collection('orders').doc(orderId).get();
+            if (normSnap.exists) fsData = normSnap.data();
+          }
         }
       } catch (e) { console.error('cancel fs lookup notice:', e.message); }
       if (!fsData) return res.status(404).json({ success: false, error: 'Order not found' });
