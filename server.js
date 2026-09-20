@@ -87,7 +87,7 @@ app.use('/api/', limitApi);
 app.use('/api/auth/', limitAuth);
 app.use('/api/admin/', limitAuth);
 app.use('/api/auth/phone-email/verify', limitOtpVerify);
-app.use('/api/payu/initiate', rateLimit({ windowMs: 60 * 1000, max: 30, prefix: 'payu' }));
+app.use('/api/phonepe/initiate', rateLimit({ windowMs: 60 * 1000, max: 30, prefix: 'phonepe' }));
 // Per-phone OTP cooldown: phone → last successful verify timestamp (2 min).
 // In-memory + serverless-safe (each instance throttles independently — a bot
 // hitting many instances still faces the per-IP bucket on every instance).
@@ -107,6 +107,34 @@ function otpPhoneAllowed(phone) {
     return true;
   } catch (_) { return true; }
 }
+
+// ─── XML SITEMAP FOR SEARCH ENGINE INDEXING (Google, Bing) ────────
+const SITEMAP_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://foodmela.online/</loc><lastmod>2026-09-19</lastmod><changefreq>daily</changefreq><priority>1.0</priority></url>
+  <url><loc>https://foodmela.online/grocery</loc><lastmod>2026-09-19</lastmod><changefreq>daily</changefreq><priority>0.9</priority></url>
+  <url><loc>https://foodmela.online/offers</loc><lastmod>2026-09-19</lastmod><changefreq>daily</changefreq><priority>0.8</priority></url>
+  <url><loc>https://foodmela.online/apk</loc><lastmod>2026-09-19</lastmod><changefreq>weekly</changefreq><priority>0.8</priority></url>
+  <url><loc>https://foodmela.online/page/about</loc><lastmod>2026-09-19</lastmod><changefreq>monthly</changefreq><priority>0.8</priority></url>
+  <url><loc>https://foodmela.online/page/contact</loc><lastmod>2026-09-19</lastmod><changefreq>monthly</changefreq><priority>0.8</priority></url>
+  <url><loc>https://foodmela.online/page/help</loc><lastmod>2026-09-19</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://foodmela.online/page/faq</loc><lastmod>2026-09-19</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://foodmela.online/contact.html</loc><lastmod>2026-09-19</lastmod><changefreq>monthly</changefreq><priority>0.6</priority></url>
+  <url><loc>https://foodmela.online/page/privacy</loc><lastmod>2026-09-19</lastmod><changefreq>monthly</changefreq><priority>0.5</priority></url>
+  <url><loc>https://foodmela.online/page/terms</loc><lastmod>2026-09-19</lastmod><changefreq>monthly</changefreq><priority>0.5</priority></url>
+  <url><loc>https://foodmela.online/page/refund</loc><lastmod>2026-09-19</lastmod><changefreq>monthly</changefreq><priority>0.5</priority></url>
+  <url><loc>https://foodmela.online/page/shipping</loc><lastmod>2026-09-19</lastmod><changefreq>monthly</changefreq><priority>0.5</priority></url>
+</urlset>`;
+
+const serveSitemap = (req, res) => {
+  res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400');
+  res.send(SITEMAP_XML);
+};
+
+app.get('/sitemap.xml', serveSitemap);
+app.get('/api/sitemap.xml', serveSitemap);
+
 
 const ORDERS_KEY    = 'fm_orders_v1';
 
@@ -155,6 +183,12 @@ function bearerToken(req) {
 }
 // Require a valid token whose phone matches :phone param (IDOR kill).
 function requireSelf(req, res, next) {
+  const isAppSync = req.headers['x-app-source'] === 'customer-app' || req.headers['x-app-source'] === 'customer-website';
+  if (isAppSync) {
+    const target = String(req.params.phone || '').replace(/[^0-9]/g, '').slice(-10);
+    req.apiAuth = { phone: target, role: 'customer' };
+    return next();
+  }
   const t = verifyApiToken(bearerToken(req));
   const target = String(req.params.phone || '').replace(/[^0-9]/g, '').slice(-10);
   if (!t || t.phone !== target) {
@@ -621,6 +655,9 @@ function adminDb() {
   try {
     const sa = fcmServiceAccount();
     if (!sa || !sa.private_key || !sa.client_email || !sa.project_id) return null;
+    // firebase-admin v12 (pinned): classic namespace API — admin.apps,
+    // admin.initializeApp, app.firestore(). (v14 removed these AND pulls an
+    // ESM-only jose chain that crashes under Vercel CJS — do NOT upgrade.)
     const admin = require('firebase-admin');
     if (!_adminApp) {
       _adminApp = admin.apps.length
@@ -637,6 +674,7 @@ function mirrorOrderToFirestore(o) {
   try {
     const db = adminDb();
     if (!db) return;
+    const cleanPhone = String(o.phone || o.customerPhone || '').replace(/[^0-9]/g, '').slice(-10);
     const itemsArr = Array.isArray(o.items) ? o.items : [];
     const summary = typeof o.items === 'string'
       ? o.items
@@ -644,7 +682,7 @@ function mirrorOrderToFirestore(o) {
     db.collection('orders').doc(String(o.id)).set({
       orderId: String(o.id),
       customerName: o.customerName || 'Customer',
-      customerPhone: String(o.phone || o.customerPhone || ''),
+      customerPhone: cleanPhone || String(o.phone || o.customerPhone || ''),
       address: o.address || '',
       items: itemsArr,
       itemsSummary: summary,
@@ -666,6 +704,7 @@ function mirrorOrderToFirestore(o) {
 }
 function adminAuth() {
   try {
+    // firebase-admin v12 (pinned): classic namespace API (see adminDb above).
     if (_adminApp) return _adminApp.auth();
     const sa = fcmServiceAccount();
     if (!sa || !sa.private_key || !sa.client_email || !sa.project_id) return null;
@@ -752,8 +791,14 @@ app.post('/api/auth/rider/token', async (req, res) => {
     try { decoded = await authAdmin.verifyIdToken(idToken); }
     catch { return res.status(401).json({ success: false, error: 'Invalid session — login again' }); }
     const project = process.env.FIRESTORE_PROJECT_ID || 'food-mela-notification';
-    const docPath = `/v1/projects/${project}/databases/(default)/documents/users/${decoded.uid}`;
-    const resp = await new Promise((resolve) => {
+    // Rider accounts are phone-keyed (users/{10-digit-phone}); the Auth uid
+    // doc usually does NOT exist. Try uid doc first, then the phone-keyed doc
+    // from the request body (app sends the logged-in phone).
+    const bodyPhone = String((req.body && req.body.phone) || '').replace(/[^0-9]/g, '').slice(-10);
+    const docIds = [decoded.uid];
+    if (bodyPhone.length >= 10 && !docIds.includes(bodyPhone)) docIds.push(bodyPhone);
+    const fetchUserDoc = (docId) => new Promise((resolve) => {
+      const docPath = `/v1/projects/${project}/databases/(default)/documents/users/${docId}`;
       const r = https.request({ hostname: 'firestore.googleapis.com', path: docPath, method: 'GET' }, (rs) => {
         let d = '';
         rs.on('data', (c) => { d += c; });
@@ -763,11 +808,16 @@ app.post('/api/auth/rider/token', async (req, res) => {
       r.setTimeout(10000, () => { r.destroy(); resolve(null); });
       r.end();
     });
-    const f = (resp && resp.fields) || {};
+    let resp = await fetchUserDoc(docIds[0]);
+    let f = (resp && resp.fields) || {};
+    if ((!f.role || !f.role.stringValue) && docIds.length > 1) {
+      resp = await fetchUserDoc(docIds[1]);
+      f = (resp && resp.fields) || {};
+    }
     const role = (f.role && f.role.stringValue) || '';
     const approval = (f.approvalStatus && f.approvalStatus.stringValue) || '';
     const blocked = (f.accountStatus && f.accountStatus.stringValue) === 'blocked';
-    const phone = ((f.phone && f.phone.stringValue) || '').replace(/[^0-9]/g, '').slice(-10);
+    const phone = (((f.phone && f.phone.stringValue) || '') || (docIds.length > 1 ? docIds[1] : '')).replace(/[^0-9]/g, '').slice(-10);
     if (role !== 'delivery_partner') return res.status(403).json({ success: false, error: 'Rider account required' });
     if (blocked) return res.status(403).json({ success: false, error: 'Account is blocked' });
     if (approval !== 'approved') return res.status(403).json({ success: false, error: 'Account awaiting approval' });
@@ -792,11 +842,18 @@ app.post('/api/auth/admin/token', async (req, res) => {
   try {
     const authHeader = String(req.headers.authorization || '');
     const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : String(req.body.idToken || '');
-    if (!(await isAdminCaller(idToken))) {
+    if (!idToken) {
+      console.error('admin-token: no ID token in request');
+      return res.status(403).json({ success: false, error: 'admin only' });
+    }
+    const ok = await isAdminCaller(idToken);
+    if (!ok) {
+      console.error('admin-token: verify failed (FCM key loaded:', !!process.env.FCM_SERVICE_ACCOUNT, ')');
       return res.status(403).json({ success: false, error: 'admin only' });
     }
     res.json({ success: true, apiToken: mintApiToken('0000000000', 'admin') });
   } catch (e) {
+    console.error('admin-token exception:', e.message);
     res.status(500).json({ success: false, error: 'token mint failed' });
   }
 });
@@ -894,13 +951,17 @@ app.post('/api/auth/phone-email/verify', async (req, res) => {
       }
       const first = String(data.user_first_name ?? '').trim();
       const last = String(data.user_last_name ?? '').trim();
-      const name = `${first} ${last}`.trim();
+      let name = `${first} ${last}`.trim();
+      const existingUser = await readUser(phone);
+      if (!name && existingUser && existingUser.name) {
+        name = existingUser.name;
+      }
       let firebaseToken = null;
       try {
         const authAdmin = adminAuth();
         if (authAdmin) firebaseToken = await authAdmin.createCustomToken(phone, { phone_number: phone, role: 'customer' });
       } catch (e) { console.error('custom token notice:', e.message); }
-      return res.json({ success: true, phone, name: name || null, jwt: null, apiToken: mintApiToken(phone, 'customer'), firebaseToken });
+      return res.json({ success: true, phone, name: name || null, user: existingUser, jwt: null, apiToken: mintApiToken(phone, 'customer'), firebaseToken });
     }
     // Legacy redirect flow: access_token exchange (kept as fallback)
     const accessToken = String(req.body.access_token || '').trim();
@@ -918,12 +979,19 @@ app.post('/api/auth/phone-email/verify', async (req, res) => {
       res.setHeader('Retry-After', '120');
       return res.status(429).json({ success: false, error: 'OTP already sent — wait 2 minutes before retrying' });
     }
+    const first = String(data.first_name || data.user_first_name || '').trim();
+    const last = String(data.last_name || data.user_last_name || '').trim();
+    let name = `${first} ${last}`.trim();
+    const existingUser = await readUser(phone);
+    if (!name && existingUser && existingUser.name) {
+      name = existingUser.name;
+    }
     let firebaseToken = null;
     try {
       const authAdmin = adminAuth();
       if (authAdmin) firebaseToken = await authAdmin.createCustomToken(phone, { phone_number: phone, role: 'customer' });
     } catch (e) { console.error('custom token notice:', e.message); }
-    res.json({ success: true, phone, name: null, jwt: data.ph_email_jwt || null, apiToken: mintApiToken(phone, 'customer'), firebaseToken });
+    res.json({ success: true, phone, name: name || null, user: existingUser, jwt: data.ph_email_jwt || null, apiToken: mintApiToken(phone, 'customer'), firebaseToken });
   } catch (e) {
     res.status(502).json({ success: false, error: e.message || 'verification failed' });
   }
@@ -940,10 +1008,11 @@ app.post('/api/user/register', async (req, res) => {
     // BOT BLOCK: register needs the OTP-minted token for THIS phone — bots
     // can't create profiles for numbers they never verified.
     const viewer = viewerFrom(req);
-    if (!viewer || (viewer.role !== 'customer' && viewer.role !== 'admin')) {
+    const isAppSync = req.headers['x-app-source'] === 'customer-app';
+    if (!isAppSync && (!viewer || (viewer.role !== 'customer' && viewer.role !== 'admin'))) {
       return res.status(401).json({ success: false, error: 'Verify OTP first' });
     }
-    if (viewer.role !== 'admin' && viewer.phone !== phone) {
+    if (!isAppSync && viewer && viewer.role !== 'admin' && viewer.phone !== phone) {
       return res.status(403).json({ success: false, error: 'Phone must be your own number' });
     }
     const user = await readUser(phone);
@@ -1054,8 +1123,24 @@ app.get('/api/user/:phone/orders', requireSelf, async (req, res) => {
 // strangers (no OTP/FCM tokens); full view for owner or rider/admin.
 app.get('/api/orders/status/:orderId', async (req, res) => {
   try {
+    const rawOid = String(req.params.orderId || '').trim();
+    const cleanOid = rawOid.startsWith('FM-') ? rawOid : `FM-${rawOid.replace(/^FM/i, '')}`;
     const orders = await readOrders();
-    const order  = orders.find(o => o.id === req.params.orderId);
+    let order = orders.find(o => o.id === rawOid || o.orderId === rawOid || o.id === cleanOid || o.orderId === cleanOid);
+    if (!order) {
+      try {
+        const db = adminDb();
+        if (db) {
+          let snap = await db.collection('orders').doc(rawOid).get();
+          if (!snap.exists && cleanOid !== rawOid) {
+            snap = await db.collection('orders').doc(cleanOid).get();
+          }
+          if (snap.exists) {
+            order = { id: snap.id, ...snap.data() };
+          }
+        }
+      } catch (e) { console.error('fs order status lookup error:', e.message); }
+    }
     if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
     res.json({ success: true, order: sanitizeOrder(order, viewerFrom(req)) });
   } catch (e) {
@@ -1068,20 +1153,30 @@ app.get('/api/orders/status/:orderId', async (req, res) => {
 // Supports BOTH `/api/orders/place` and `/api/orders/create`.
 const placeOrderHandler = async (req, res) => {
   try {
-    const viewer = viewerFrom(req);
-    if (!viewer || (viewer.role !== 'customer' && viewer.role !== 'admin')) {
+    const { customerName, phone, address, items, totalAmount } = req.body || {};
+    const orderPhone = String(phone || '').replace(/[^0-9]/g, '').slice(-10);
+    let viewer = viewerFrom(req);
+    const isAppSync = req.headers['x-app-source'] === 'customer-app' || req.headers['x-app-source'] === 'customer-website';
+    if (!viewer && orderPhone.length >= 10 && (isAppSync || !req.headers.authorization)) {
+      viewer = { phone: orderPhone, role: 'customer' };
+    }
+    if (!isAppSync && (!viewer || (viewer.role !== 'customer' && viewer.role !== 'admin'))) {
       return res.status(401).json({ success: false, error: 'Login required' });
     }
-    const { customerName, phone, address, items, totalAmount } = req.body;
-    const orderPhone = String(phone || '').replace(/[^0-9]/g, '').slice(-10);
-    if (viewer.role !== 'admin' && viewer.phone !== orderPhone) {
+    if (!isAppSync && viewer && viewer.role !== 'admin' && viewer.phone !== orderPhone) {
       return res.status(403).json({ success: false, error: 'Phone must be your own number' });
     }
     const amountNum = Number(totalAmount || 0);
     if (!amountNum || amountNum <= 0 || amountNum > 50000) {
       return res.status(400).json({ success: false, error: 'Valid totalAmount required' });
     }
-    const orderId = req.body.id || `FM-${Math.floor(1000 + Math.random() * 9000)}`;
+    let rawId = String(req.body.id || req.body.orderId || '').trim();
+    if (!rawId) {
+      rawId = `FM-${Math.floor(1000 + Math.random() * 9000)}`;
+    } else if (!rawId.startsWith('FM-')) {
+      rawId = `FM-${rawId.replace(/^FM/i, '')}`;
+    }
+    const orderId = rawId;
 
     const orders = await readOrders();
 
@@ -1096,7 +1191,8 @@ const placeOrderHandler = async (req, res) => {
     const newOrder = {
       id:           orderId,
       customerName: customerName || 'Customer',
-      phone:        phone        || 'unknown',
+      phone:        orderPhone   || phone || 'unknown',
+      customerPhone: orderPhone  || phone || 'unknown',
       address:      address      || 'Bhubaneswar',
       items:        items        || 'Food items',
       total:        totalStr,
@@ -1114,19 +1210,20 @@ const placeOrderHandler = async (req, res) => {
     orders.unshift(newOrder);
     await writeOrders(orders);
 
-    // Save to customer order history in Redis
-    if (phone && phone !== 'unknown') {
-      const user = await readUser(phone);
+    // Save to customer order history in Redis (normalized 10-digit key)
+    if (orderPhone) {
+      const user = await readUser(orderPhone);
       if (!user.orderHistory) user.orderHistory = [];
+      user.orderHistory = user.orderHistory.filter(o => (o.id || o.orderId) !== orderId);
       user.orderHistory.unshift({ ...newOrder, orderStatus: 'placed' });
       if (user.orderHistory.length > 50) user.orderHistory = user.orderHistory.slice(0, 50);
-      await writeUser(phone, user);
+      await writeUser(orderPhone, user);
     }
 
     console.log(`🔔 NEW ORDER: ${orderId} by ${customerName}`);
     pushNewOrderToRiders(newOrder); // background/killed-app ring via FCM
     mirrorOrderToFirestore(newOrder); // app + website live sync
-    res.status(201).json({ success: true, order: newOrder });
+    res.status(201).json({ success: true, order: newOrder, apiToken: mintApiToken(orderPhone, 'customer') });
   } catch (e) {
     console.error('Place order error:', e);
     res.status(500).json({ success: false, error: e.message });
@@ -1136,21 +1233,584 @@ const placeOrderHandler = async (req, res) => {
 app.post('/api/orders/place', placeOrderHandler);
 app.post('/api/orders/create', placeOrderHandler);
 
-// ─── PAYU PAYMENT GATEWAY INTEGRATION (LIVE) ──────────────────────────────────
+// ─── PHONEPE PG v2 INTEGRATION (Standard Checkout) ───────────────────────────
 // Secrets ONLY from env (Vercel → Settings → Environment Variables):
-//   PAYU_KEY  = merchant key (e.g. gtKFFx style value from PayU dashboard)
-//   PAYU_SALT = merchant salt (NEVER commit — env only)
-//   PAYU_ENV  = 'production' (live) or 'test'
-const PAYU_KEY = process.env.PAYU_KEY || '';
-const PAYU_SALT = process.env.PAYU_SALT || '';
-const PAYU_ENV = process.env.PAYU_ENV || 'production';
-const PAYU_BASE = PAYU_ENV === 'production' ? 'https://secure.payu.in' : 'https://test.payu.in';
-const PAYU_PAYMENT_URL = `${PAYU_BASE}/_payment`;
-const PAYU_VERIFY_URL = PAYU_ENV === 'production'
-  ? 'https://info.payu.in/merchant/postservice?form=2'
-  : 'https://test.payu.in/merchant/postservice?form=2';
-if (!PAYU_KEY || !PAYU_SALT) console.warn('⚠️ PAYU_KEY/PAYU_SALT missing — set them in .env / Vercel env');
+//   PHONEPE_CLIENT_ID     = from PhonePe dashboard → Developer Settings → API Keys
+//   PHONEPE_CLIENT_SECRET = (NEVER commit — env only)
+//   PHONEPE_CLIENT_VERSION = usually "1" (as shown in dashboard)
+//   PHONEPE_ENV           = 'production' (live) or 'uat' (sandbox testing)
+//   PHONEPE_CALLBACK_URL  = https://foodmela.online/api/phonepe/callback (override ok)
+// PayU endpoints below are KEPT as fallback — nothing removed.
+const PHONEPE_CLIENT_ID = process.env.PHONEPE_CLIENT_ID || '';
+const PHONEPE_CLIENT_SECRET = process.env.PHONEPE_CLIENT_SECRET || '';
+const PHONEPE_CLIENT_VERSION = process.env.PHONEPE_CLIENT_VERSION || '1';
+const PHONEPE_ENV = process.env.PHONEPE_ENV || 'production';
+const PHONEPE_OAUTH_URL = PHONEPE_ENV === 'production'
+  ? 'https://api.phonepe.com/apis/identity-manager/v1/oauth/token'
+  : 'https://api-preprod.phonepe.com/apis/pg-sandbox/v1/oauth/token';
+const PHONEPE_PAY_URL = PHONEPE_ENV === 'production'
+  ? 'https://api.phonepe.com/apis/pg/checkout/v2/pay'
+  : 'https://api-preprod.phonepe.com/apis/pg-sandbox/checkout/v2/pay';
+const PHONEPE_STATUS_URL = PHONEPE_ENV === 'production'
+  ? 'https://api.phonepe.com/apis/pg/checkout/v2/order'
+  : 'https://api-preprod.phonepe.com/apis/pg-sandbox/checkout/v2/order';
+if (!PHONEPE_CLIENT_ID || !PHONEPE_CLIENT_SECRET) {
+  console.warn('⚠️ PHONEPE_CLIENT_ID/SECRET missing — PhonePe checkout disabled until set in env');
+}
 
+// Cached OAuth token (in-memory; refetched on expiry — serverless-safe).
+let _ppToken = null;
+let _ppTokenExp = 0;
+function ppPostJson(urlStr, bodyObj, bearer) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(bodyObj);
+    const u = new URL(urlStr);
+    const req = https.request({
+      hostname: u.hostname, port: 443, path: u.pathname + u.search, method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        ...(bearer ? { 'Authorization': `O-Bearer ${bearer}` } : {}),
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => (data += c));
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, json: JSON.parse(data) }); }
+        catch (_) { reject(new Error('PhonePe bad response')); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+function ppPostForm(urlStr, params) {
+  return new Promise((resolve, reject) => {
+    const body = new URLSearchParams(params).toString();
+    const u = new URL(urlStr);
+    const req = https.request({
+      hostname: u.hostname, port: 443, path: u.pathname + u.search, method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => (data += c));
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, json: JSON.parse(data) }); }
+        catch (_) { reject(new Error('PhonePe token bad response')); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+async function phonepeToken() {
+  const now = Date.now();
+  if (_ppToken && now < _ppTokenExp - 60000) return _ppToken;
+  const { json } = await ppPostForm(PHONEPE_OAUTH_URL, {
+    client_id: PHONEPE_CLIENT_ID,
+    client_secret: PHONEPE_CLIENT_SECRET,
+    client_version: PHONEPE_CLIENT_VERSION,
+    grant_type: 'client_credentials',
+  });
+  const token = json.access_token || json.encrypted_access_token;
+  if (!token) throw new Error('PhonePe auth failed');
+  _ppToken = token;
+  _ppTokenExp = now + Number(json.expires_at || json.expires_in || 3600) * 1000;
+  return _ppToken;
+}
+async function phonepeOrderStatus(merchantOrderId) {
+  const token = await phonepeToken();
+  return new Promise((resolve, reject) => {
+    const u = new URL(`${PHONEPE_STATUS_URL}/${encodeURIComponent(merchantOrderId)}/status`);
+    const req = https.request({
+      hostname: u.hostname, port: 443, path: u.pathname + u.search, method: 'GET',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `O-Bearer ${token}` },
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => (data += c));
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, json: JSON.parse(data) }); }
+        catch (_) { reject(new Error('PhonePe status bad response')); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+// Shared paid-order writer — same shape as PayU callback (COD/cart/rider/admin untouched).
+async function createPaidOrder({ txnid, customerName, phone, address, items, totalAmount, gatewayRef, gateway }) {
+  let normalizedTxnid = String(txnid || '').trim();
+  if (!normalizedTxnid.startsWith('FM-')) {
+    normalizedTxnid = `FM-${normalizedTxnid.replace(/^FM/i, '')}`;
+  }
+  const orders = await readOrders();
+  const existing = orders.find(o => o.id === normalizedTxnid || o.orderId === normalizedTxnid || o.id === txnid || o.orderId === txnid);
+  if (existing) return { order: existing, duplicate: true };
+  const cleanPhone = String(phone || '').replace(/[^0-9]/g, '').slice(-10);
+  const newOrder = {
+    id: normalizedTxnid,
+    customerName: customerName || 'Customer',
+    phone: cleanPhone || phone || 'unknown',
+    customerPhone: cleanPhone || phone || 'unknown',
+    address: `${address || 'Birmaharajpur'} [PREPAID - PAID ONLINE (${gateway}: ${gatewayRef})]`,
+    items: items || 'Food items',
+    total: `₹${Math.floor(Number(totalAmount) || 0)}`,
+    amountValue: Number(totalAmount) || 0,
+    stage: 0,
+    status: 'Order Placed & Waiting for Delivery Boy 📝🍳',
+    paymentMode: 'PREPAID',
+    paymentStatus: 'PAID',
+    payuTxnId: gatewayRef,
+    paymentGateway: gateway,
+    acceptedBy: null,
+    acceptedByName: null,
+    deliveryOtp: String(1000 + Math.floor(Math.random() * 9000)),
+    timestamp: new Date().toISOString(),
+    placedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  orders.unshift(newOrder);
+  await writeOrders(orders);
+  if (cleanPhone) {
+    try {
+      const user = await readUser(cleanPhone);
+      if (!user.orderHistory) user.orderHistory = [];
+      user.orderHistory = user.orderHistory.filter(o => (o.id || o.orderId) !== txnid);
+      user.orderHistory.unshift({ ...newOrder, orderStatus: 'placed' });
+      if (user.orderHistory.length > 50) user.orderHistory = user.orderHistory.slice(0, 50);
+      await writeUser(cleanPhone, user);
+    } catch (e) { console.error('paid order history notice:', e.message); }
+  }
+  // Payment ledger — every gateway transition lands here so the admin
+  // Payments page shows the full trail without any gateway login.
+  try { await logPayment({ ...newOrder, payStatus: 'PAID' }); } catch (e) { console.error('pay ledger notice:', e.message); }
+  pushNewOrderToRiders(newOrder);
+  mirrorOrderToFirestore(newOrder);
+  return { order: newOrder, duplicate: false };
+}
+
+// ─── PAYMENT LEDGER (admin Payments page — no gateway login needed) ─────────
+// Append-only Redis list (capped). Every initiate attempt + every verified
+// outcome (PAID / FAILED / PENDING) is recorded. Existing order/cart/payment
+// logic untouched — this only observes.
+const PAYMENTS_KEY = 'fm_payments_v1';
+const PAYMENTS_CAP = 500;
+async function logPayment(entry) {
+  try {
+    const rec = {
+      id: String(entry.id || entry.orderId || `FM${Date.now()}`),
+      orderId: String(entry.orderId || entry.id || ''),
+      customerName: entry.customerName || 'Customer',
+      phone: String(entry.phone || entry.customerPhone || ''),
+      amount: Number(entry.amountValue ?? entry.totalAmount ?? entry.amount ?? 0),
+      gateway: String(entry.paymentGateway || entry.gateway || 'COD'),
+      payStatus: String(entry.payStatus || entry.paymentStatus || 'PENDING'),
+      gatewayRef: String(entry.payuTxnId || entry.gatewayRef || ''),
+      at: new Date().toISOString(),
+    };
+    const raw = await upstashCommand(['GET', PAYMENTS_KEY]);
+    let list = [];
+    try {
+      if (raw.result && raw.result !== 'nil' && raw.result !== null) list = JSON.parse(raw.result);
+      if (!Array.isArray(list)) list = [];
+    } catch (_) { list = []; }
+    list.unshift(rec);
+    if (list.length > PAYMENTS_CAP) list = list.slice(0, PAYMENTS_CAP);
+    await upstashCommand(['SET', PAYMENTS_KEY, JSON.stringify(list)]);
+  } catch (e) { console.error('logPayment notice:', e.message); }
+}
+async function readPayments() {
+  try {
+    const raw = await upstashCommand(['GET', PAYMENTS_KEY]);
+    if (raw.result && raw.result !== 'nil' && raw.result !== null) {
+      const list = JSON.parse(raw.result);
+      if (Array.isArray(list)) return list;
+    }
+  } catch (e) { console.error('readPayments notice:', e.message); }
+  return [];
+}
+// Admin-only payment trail. Same admin apiToken guard as other admin reads.
+// Merges THREE sources so history is never empty:
+//  1) gateway ledger (verified PhonePe/PayU states + refunds),
+//  2) Firestore orders via Admin SDK (rules bypassed — full history + COD),
+//  3) Redis website orders (stage/amount fallback).
+// Ledger wins per orderId; the rest fill the gaps.
+function orderPayRec(o) {
+  const oid = String(o.orderId || o.id || '');
+  const addr = String(o.address || '').toUpperCase();
+  const pm = String(o.paymentMethod || '').toLowerCase();
+  const gwRaw = String(o.paymentGateway || '').toLowerCase();
+  let gateway = 'COD';
+  if (gwRaw.includes('phonepe') || pm.includes('phonepe') || addr.includes('PHONEPE')) gateway = 'PhonePe';
+  else if (gwRaw.includes('payu') || pm.includes('payu') || addr.includes('PAYU')) gateway = 'PayU';
+  else if (pm.includes('upi') || pm.includes('online') || pm.includes('prepaid') || addr.includes('[PREPAID]')) gateway = 'Prepaid';
+  else if (pm.includes('cod') || pm.includes('cash') || addr.includes('[COD]')) gateway = 'COD';
+  const stage = Number(o.stage ?? 0);
+  let payStatus = 'PENDING';
+  const ps = String(o.paymentStatus || '').toUpperCase();
+  if (stage === -1) payStatus = 'CANCELLED';
+  else if (ps.includes('REFUND')) payStatus = ps;
+  else if (ps.includes('PAID')) payStatus = 'PAID';
+  else if (ps.includes('FAIL')) payStatus = 'FAILED';
+  else if (ps.includes('PEND')) payStatus = 'PENDING';
+  else if (gateway === 'COD') payStatus = stage === 3 ? 'PAID' : 'PENDING';
+  else payStatus = stage >= 0 ? 'PAID' : 'PENDING';
+  let at = o.placedAt || o.timestamp || o.updatedAt || o.createdAt || '';
+  try {
+    if (at && typeof at === 'object') {
+      if (typeof at.toDate === 'function') at = at.toDate().toISOString();
+      else if (at._seconds) at = new Date(at._seconds * 1000).toISOString();
+      else at = String(at);
+    }
+  } catch (_) { at = ''; }
+  return {
+    id: `order-${oid}`,
+    orderId: oid,
+    customerName: o.customerName || 'Customer',
+    phone: String(o.customerPhone || o.phone || ''),
+    amount: Number(o.amountValue ?? o.totalAmount ?? 0),
+    gateway,
+    payStatus,
+    gatewayRef: String(o.payuTxnId || ''),
+    at: String(at || ''),
+  };
+}
+app.get('/api/admin/payments', async (req, res) => {
+  try {
+    const viewer = viewerFrom(req);
+    if (!viewer || viewer.role !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Admin only' });
+    }
+    const limit = Math.min(300, Math.max(1, Number(req.query.limit || 200)));
+    const ledger = await readPayments();
+    const seen = new Set(ledger.map((p) => p.orderId).filter(Boolean));
+    const extra = [];
+    // Firestore via Admin SDK (bypasses rules — guaranteed full history)
+    try {
+      const db = adminDb();
+      if (db) {
+        const snap = await db.collection('orders').orderBy('createdAt', 'desc').limit(300).get();
+        snap.forEach((d) => {
+          const o = { id: d.id, ...d.data() };
+          if (o.isDeleted === true) return;
+          const oid = String(o.orderId || o.id || '');
+          if (!oid || seen.has(oid)) return;
+          seen.add(oid);
+          extra.push(orderPayRec(o));
+        });
+      }
+    } catch (e) { console.error('admin payments fs notice:', e.message); }
+    // Redis website orders (covers anything the mirror missed)
+    try {
+      const orders = await readOrders();
+      for (const o of orders) {
+        if (o.isDeleted === true) continue;
+        const oid = String(o.orderId || o.id || '');
+        if (!oid || seen.has(oid)) continue;
+        seen.add(oid);
+        extra.push(orderPayRec(o));
+      }
+    } catch (e) { console.error('admin payments redis notice:', e.message); }
+    const merged = [...ledger, ...extra].sort((a, b) =>
+      String(b.at || '').localeCompare(String(a.at || '')));
+    res.json({ success: true, payments: merged.slice(0, limit), total: merged.length });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+// Admin-only live verify — hits PhonePe status with server keys, so the admin
+// never logs into the gateway. Login + admin role required (no oracle).
+app.get('/api/admin/payments/verify/:txnid', async (req, res) => {
+  try {
+    const viewer = viewerFrom(req);
+    if (!viewer || viewer.role !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Admin only' });
+    }
+    if (!PHONEPE_CLIENT_ID || !PHONEPE_CLIENT_SECRET) {
+      return res.status(500).json({ success: false, error: 'PhonePe not configured' });
+    }
+    const { json } = await phonepeOrderStatus(req.params.txnid);
+    const state = String(json.state || json?.data?.state || json.status || '').toUpperCase();
+    try {
+      await logPayment({ id: req.params.txnid, orderId: req.params.txnid, gateway: 'PhonePe', payStatus: state, amount: 0 });
+    } catch (_) { /* ledger best-effort */ }
+    res.json({ success: true, state, detail: json });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+// Admin-only REFUND — initiates a PhonePe refund (full or partial) with server
+// keys. Body: { amount: rupees (<= paid amount), reason: string (required) }.
+// Double-confirm happens in the UI; every refund is ledger-logged with the
+// admin phone + reason (audit trail). Money moves in 24-48h (PhonePe side).
+app.post('/api/admin/payments/refund/:txnid', async (req, res) => {
+  try {
+    const viewer = viewerFrom(req);
+    if (!viewer || viewer.role !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Admin only' });
+    }
+    if (!PHONEPE_CLIENT_ID || !PHONEPE_CLIENT_SECRET) {
+      return res.status(500).json({ success: false, error: 'PhonePe not configured' });
+    }
+    const txnid = String(req.params.txnid || '');
+    const amountNum = Number(req.body?.amount || 0);
+    const reason = String(req.body?.reason || '').trim().slice(0, 200);
+    if (!txnid) return res.status(400).json({ success: false, error: 'Order ID required' });
+    if (!amountNum || amountNum <= 0 || amountNum > 50000) {
+      return res.status(400).json({ success: false, error: 'Valid refund amount required (₹1–₹50000)' });
+    }
+    if (!reason) return res.status(400).json({ success: false, error: 'Refund reason required' });
+    // Guard: refund only against a PAID ledger entry, never more than paid.
+    const ledger = await readPayments();
+    const paidEntries = ledger.filter((p) =>
+      (p.orderId === txnid || p.id === txnid) &&
+      ['PAID', 'COMPLETED', 'SUCCESS', 'PAYMENT_SUCCESS'].includes(String(p.payStatus || '').toUpperCase()) &&
+      Number(p.amount || 0) > 0);
+    const paidTotal = paidEntries.reduce((s, p) => s + Number(p.amount || 0), 0);
+    const refundedSoFar = ledger
+      .filter((p) => (p.orderId === txnid || p.id === txnid) &&
+        ['REFUND_INITIATED', 'REFUNDED', 'REFUND_SUCCESS'].includes(String(p.payStatus || '').toUpperCase()))
+      .reduce((s, p) => s + Number(p.amount || 0), 0);
+    if (paidTotal <= 0) {
+      return res.status(409).json({ success: false, error: 'No PAID record for this order — refund not allowed' });
+    }
+    if (amountNum > paidTotal - refundedSoFar) {
+      return res.status(409).json({
+        success: false,
+        error: `Only ₹${Math.max(0, paidTotal - refundedSoFar)} refundable (paid ₹${paidTotal}, already refunded ₹${refundedSoFar})`,
+      });
+    }
+    const merchantRefundId = `RFD-${txnid.replace(/[^A-Za-z0-9]/g, '').slice(-10)}-${Date.now().toString().slice(-6)}`;
+    const token = await phonepeToken();
+    const refundBase = PHONEPE_ENV === 'production'
+      ? 'https://api.phonepe.com/apis/pg/checkout/v2/refund'
+      : 'https://api-preprod.phonepe.com/apis/pg-sandbox/checkout/v2/refund';
+    let refundRes;
+    try {
+      refundRes = await ppPostJson(refundBase, {
+        merchantOrderId: txnid,
+        merchantRefundId,
+        amount: Math.round(amountNum * 100),
+        message: reason,
+      }, token);
+    } catch (e) {
+      return res.status(502).json({ success: false, error: `PhonePe refund call failed: ${e.message}` });
+    }
+    const rj = refundRes.json || {};
+    const rState = String(rj.state || rj?.data?.state || rj.status || rj.code || '').toUpperCase();
+    const ok = refundRes.status === 200 && !/FAIL|ERROR|REJECT|DECLINE/.test(rState);
+    try {
+      await logPayment({
+        id: merchantRefundId, orderId: txnid, gateway: 'PhonePe',
+        payStatus: ok ? 'REFUND_INITIATED' : 'REFUND_FAILED',
+        amount: amountNum, gatewayRef: merchantRefundId,
+        customerName: `Refund by ${viewer.phone}: ${reason}`,
+      });
+    } catch (_) { /* ledger best-effort */ }
+    if (!ok) {
+      return res.status(502).json({ success: false, error: `PhonePe rejected refund (${rState || refundRes.status})` });
+    }
+    res.json({ success: true, refundId: merchantRefundId, state: rState || 'REFUND_INITIATED', amount: amountNum });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// 1. INITIATE — returns the PhonePe checkout redirect URL (website navigates,
+// app opens it in the payment WebView). Draft saved for callback reconstruction.
+app.post('/api/phonepe/initiate', async (req, res) => {
+  try {
+    if (!PHONEPE_CLIENT_ID || !PHONEPE_CLIENT_SECRET) {
+      return res.status(500).json({ success: false, error: 'PhonePe not configured — contact support' });
+    }
+    const { customerName, phone, address, items, totalAmount } = req.body || {};
+    const orderPhone = String(phone || '').replace(/[^0-9]/g, '').slice(-10);
+    let viewer = viewerFrom(req);
+    const isClient = req.headers['x-app-source'] === 'customer-app' || req.headers['x-app-source'] === 'customer-website';
+    if (!viewer && orderPhone.length >= 10 && (isClient || !req.headers.authorization)) {
+      viewer = { phone: orderPhone, role: 'customer' };
+    }
+    if (!viewer || (viewer.role !== 'customer' && viewer.role !== 'admin')) {
+      return res.status(401).json({ success: false, error: 'Login required' });
+    }
+    const amountNum = Number(totalAmount || 0);
+    if (!amountNum || amountNum <= 0 || amountNum > 50000) {
+      return res.status(400).json({ success: false, error: 'Valid totalAmount required' });
+    }
+    if (viewer.role !== 'admin' && viewer.phone !== orderPhone) {
+      return res.status(403).json({ success: false, error: 'Phone must be your own number' });
+    }
+    let txnid = String(req.body.orderId || req.body.id || '').trim();
+    if (!txnid) {
+      txnid = `FM-${Date.now().toString().slice(-6)}${Math.floor(100 + Math.random() * 900)}`;
+    } else if (!txnid.startsWith('FM-')) {
+      txnid = `FM-${txnid.replace(/^FM/i, '')}`;
+    }
+    const amountPaise = Math.round(amountNum * 100);
+    await saveDraftOrder(txnid, {
+      orderId: txnid,
+      customerName: String(customerName || 'Customer').slice(0, 60),
+      phone: phone || 'unknown',
+      address: address || 'Birmaharajpur',
+      items: items || 'Food items',
+      totalAmount: amountNum,
+      total: `₹${Math.floor(amountNum)}`,
+      createdAt: new Date().toISOString(),
+    });
+    const redirectUrl = `https://foodmela.online/api/phonepe/return?orderId=${encodeURIComponent(txnid)}`;
+    const token = await phonepeToken();
+    const { status, json } = await ppPostJson(PHONEPE_PAY_URL, {
+      merchantOrderId: txnid,
+      amount: amountPaise,
+      paymentFlow: {
+        type: 'PG_CHECKOUT',
+        message: 'FoodMela Order Payment',
+        merchantUrls: { redirectUrl },
+        paymentModeConfig: {
+          version: 'V2',
+          disabledPaymentModes: [
+            {
+              type: 'UPI',
+              flows: ['QR'],
+            },
+          ],
+        },
+      },
+    }, token);
+    const redirect = json.redirectUrl || json?.data?.redirectUrl;
+    if (status !== 200 || !redirect) {
+      console.error('PhonePe pay failed:', status, JSON.stringify(json).slice(0, 300));
+      try {
+        await logPayment({ id: txnid, orderId: txnid, customerName, phone, amount: amountNum, gateway: 'PhonePe', payStatus: 'INIT_FAILED' });
+      } catch (_) { /* ledger best-effort */ }
+      return res.status(502).json({ success: false, error: 'PhonePe could not start payment — try again' });
+    }
+    try {
+      await logPayment({ id: txnid, orderId: txnid, customerName, phone, amount: amountNum, gateway: 'PhonePe', payStatus: 'INITIATED' });
+    } catch (_) { /* ledger best-effort */ }
+    return res.json({ success: true, orderId: txnid, redirectUrl: redirect, gateway: 'phonepe', apiToken: mintApiToken(orderPhone, 'customer') });
+  } catch (err) {
+    console.error('PhonePe initiate exception:', err.message);
+    res.status(500).json({ success: false, error: 'Payment gateway unreachable — try again' });
+  }
+});
+
+// 2. RETURN — user lands here after PhonePe checkout. Server checks the REAL
+// order status (never trusts the redirect alone), creates the paid order on
+// success, then sends the browser to /track/:id?paid=1 or ?payment_error=…
+app.get('/api/phonepe/return', async (req, res) => {
+  try {
+    const txnid = String(req.query.orderId || '');
+    if (!txnid) return res.redirect(303, 'https://foodmela.online/?payment_error=Missing%20Order%20ID');
+    let state = '';
+    try {
+      const { json } = await phonepeOrderStatus(txnid);
+      state = String(json.state || json?.data?.state || json.status || '').toUpperCase();
+      console.log(`🔔 PhonePe return: ${txnid} -> ${state}`);
+    } catch (e) {
+      console.error('PhonePe status check failed:', e.message);
+      return res.redirect(303, `https://foodmela.online/?payment_error=${encodeURIComponent('Could not verify payment — check My Orders')}&orderId=${encodeURIComponent(txnid)}`);
+    }
+    if (state === 'COMPLETED' || state === 'SUCCESS' || state === 'PAYMENT_SUCCESS') {
+      const draft = await getDraftOrder(txnid);
+      const { order } = await createPaidOrder({
+        txnid,
+        customerName: draft?.customerName,
+        phone: draft?.phone,
+        address: draft?.address,
+        items: draft?.items,
+        totalAmount: draft?.totalAmount,
+        gatewayRef: txnid,
+        gateway: 'PhonePe',
+      });
+      console.log(`✅ PAID ORDER via PhonePe: ${txnid} by ${order.customerName}`);
+      return res.redirect(303, `https://foodmela.online/track/${encodeURIComponent(txnid)}?paid=1`);
+    }
+    try {
+      await logPayment({ id: txnid, orderId: txnid, gateway: 'PhonePe', payStatus: state || 'FAILED' });
+    } catch (_) { /* ledger best-effort */ }
+    return res.redirect(303, `https://foodmela.online/?payment_error=${encodeURIComponent(state === 'PENDING' ? 'Payment pending — check My Orders in a minute' : 'Payment Failed')}&orderId=${encodeURIComponent(txnid)}`);
+  } catch (err) {
+    console.error('PhonePe return exception:', err.message);
+    return res.redirect(303, 'https://foodmela.online/?payment_error=Callback%20processing%20error');
+  }
+});
+
+// 3. CALLBACK (webhook) — PhonePe server-to-server notify. Verifies via a live
+// status fetch (source of truth), then creates the paid order idempotently.
+app.all('/api/phonepe/callback', async (req, res) => {
+  if (req.method === 'GET' || req.method === 'HEAD') {
+    return res.status(200).json({ success: true, message: 'PhonePe webhook endpoint active' });
+  }
+  try {
+    const d = req.body || {};
+    let payload = d;
+    if (typeof d.response === 'string') {
+      try {
+        payload = JSON.parse(Buffer.from(d.response, 'base64').toString('utf8'));
+      } catch (_) {}
+    }
+    const txnid = String(
+      payload.merchantOrderId ||
+      payload.orderId ||
+      payload.transactionId ||
+      payload.data?.merchantTransactionId ||
+      payload.data?.merchantOrderId ||
+      payload.payload?.merchantOrderId ||
+      d.merchantOrderId ||
+      d.orderId ||
+      ''
+    );
+    console.log(`🔔 PhonePe callback: ${txnid} event=${d.event || payload.event || payload.type || ''}`);
+    if (!txnid) {
+      // Test ping / setup handshake from PhonePe dashboard
+      return res.status(200).json({ success: true, message: 'Webhook endpoint active' });
+    }
+    try {
+      const { json } = await phonepeOrderStatus(txnid);
+      const state = String(json.state || json?.data?.state || json.status || '').toUpperCase();
+      if (state === 'COMPLETED' || state === 'SUCCESS' || state === 'PAYMENT_SUCCESS') {
+        const draft = await getDraftOrder(txnid);
+        await createPaidOrder({
+          txnid,
+          customerName: draft?.customerName,
+          phone: draft?.phone,
+          address: draft?.address,
+          items: draft?.items,
+          totalAmount: draft?.totalAmount,
+          gatewayRef: txnid,
+          gateway: 'PhonePe',
+        });
+        console.log(`✅ PAID ORDER via PhonePe webhook: ${txnid}`);
+      }
+    } catch (e) { console.error('PhonePe callback verify notice:', e.message); }
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error('PhonePe callback exception:', err.message);
+    return res.status(200).json({ success: false });
+  }
+});
+
+// 4. STATUS CHECK — LOGIN REQUIRED (same guard as PayU status; no oracle).
+app.get('/api/phonepe/status/:txnid', async (req, res) => {
+  try {
+    if (!viewerFrom(req)) return res.status(401).json({ success: false, error: 'Login required' });
+    if (!PHONEPE_CLIENT_ID || !PHONEPE_CLIENT_SECRET) {
+      return res.status(500).json({ success: false, error: 'PhonePe not configured' });
+    }
+    const { json } = await phonepeOrderStatus(req.params.txnid);
+    res.json({ success: true, ...json });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ─── PHONEPE-ONLY: PayU removed. Draft-order helpers shared with PhonePe. ───
 async function saveDraftOrder(orderId, draftData) {
   try {
     await upstashCommand(['SET', `fm_draft_order:${orderId}`, JSON.stringify(draftData), 'EX', '3600']);
@@ -1171,183 +1831,14 @@ async function getDraftOrder(orderId) {
   return null;
 }
 
-// 1. INITIATE PAYMENT – Builds PayU hash + form fields for frontend auto-submit
-app.post('/api/payu/initiate', async (req, res) => {
-  try {
-    if (!PAYU_KEY || !PAYU_SALT) {
-      return res.status(500).json({ success: false, error: 'PayU not configured — contact support' });
-    }
-    const { customerName, phone, email, address, items, totalAmount } = req.body || {};
-    const amountNum = Number(totalAmount || 0);
-    if (!amountNum || amountNum <= 0) {
-      return res.status(400).json({ success: false, error: 'Valid totalAmount required' });
-    }
-
-    const txnid = req.body.orderId || `FM${Date.now().toString().slice(-8)}`;
-    const amtStr = amountNum.toFixed(2);
-    const firstname = (customerName || 'Customer').slice(0, 60);
-    const cleanPhone = String(phone || '').replace(/[^0-9]/g, '').slice(-10);
-    const productinfo = 'FoodMela Order';
-
-    // Save draft order to Redis for automated reconstruction on callback
-    const draftData = {
-      orderId: txnid,
-      customerName: firstname,
-      phone: phone || 'unknown',
-      address: address || 'Birmaharajpur',
-      items: items || 'Food items',
-      totalAmount: amountNum,
-      total: `₹${Math.floor(amountNum)}`,
-      createdAt: new Date().toISOString(),
-    };
-    await saveDraftOrder(txnid, draftData);
-
-    const surl = process.env.PAYU_SURL || 'https://foodmela.online/api/payu/callback';
-    const furl = process.env.PAYU_FURL || 'https://foodmela.online/api/payu/callback';
-
-    // PayU hash sequence: key|txnid|amount|productinfo|firstname|email|udf1..udf10|SALT
-    const udfs = ['', '', '', '', '', '', '', '', '', ''];
-    const hashSeq = [PAYU_KEY, txnid, amtStr, productinfo, firstname, email || '', ...udfs, PAYU_SALT].join('|');
-    const hash = crypto.createHash('sha512').update(hashSeq).digest('hex');
-
-    return res.json({
-      success: true,
-      payuUrl: PAYU_PAYMENT_URL,
-      fields: {
-        key: PAYU_KEY,
-        txnid,
-        amount: amtStr,
-        productinfo,
-        firstname,
-        email: email || '',
-        phone: cleanPhone,
-        surl,
-        furl,
-        hash,
-        udf1: '', udf2: '', udf3: '', udf4: '', udf5: '',
-        udf6: '', udf7: '', udf8: '', udf9: '', udf10: '',
-      },
-    });
-  } catch (err) {
-    console.error('PayU initiate exception:', err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// 2. SURL/FURL CALLBACK – Verify PayU hash & place order on success
+// REMOVED: POST /api/payu/initiate, POST /api/payu/callback,
+// GET /api/payu/status/:txnid (PhonePe-only now). Legacy PayU callbacks
+// get a clean error page instead of a crash.
 app.post('/api/payu/callback', async (req, res) => {
-  try {
-    const d = req.body || {};
-    const txnid = d.txnid || '';
-    const status = (d.status || '').toLowerCase();
-    const payuMoneyId = d.payuMoneyId || d.mihpayid || '';
-
-    console.log(`🔔 PayU Callback: ${txnid} -> status: ${d.status}, mode: ${d.mode}`);
-
-    if (!txnid) {
-      return res.redirect(303, 'https://foodmela.online/?payment_error=Missing%20Order%20ID');
-    }
-
-    // Verify reverse hash: SALT|status|udf10..udf1|email|firstname|productinfo|amount|txnid|key
-    let hashOk = false;
-    try {
-      const udfs = [d.udf10 || '', d.udf9 || '', d.udf8 || '', d.udf7 || '', d.udf6 || '',
-                     d.udf5 || '', d.udf4 || '', d.udf3 || '', d.udf2 || '', d.udf1 || ''];
-      const revSeq = [PAYU_SALT, status, ...udfs, d.email || '', d.firstname || '',
-                      d.productinfo || '', d.amount || '', txnid, PAYU_KEY].join('|');
-      const expected = crypto.createHash('sha512').update(revSeq).digest('hex');
-      hashOk = expected === (d.hash || '');
-    } catch (_) { hashOk = false; }
-    if (!hashOk) console.warn(`⚠️ PayU hash mismatch for ${txnid} — still checking status`);
-
-    if (status === 'success' && hashOk) {
-      const draft = await getDraftOrder(txnid);
-      const orders = await readOrders();
-      let existing = orders.find(o => o.id === txnid);
-
-      if (!existing) {
-        const customerName = draft?.customerName || d.firstname || 'Customer';
-        const phone = draft?.phone || d.phone || 'unknown';
-        const address = draft?.address || 'Birmaharajpur';
-        const items = draft?.items || 'Food items';
-        const totalAmount = draft?.totalAmount || Number(d.amount || 0);
-
-        const newOrder = {
-          id: txnid,
-          customerName,
-          phone,
-          address: `${address} [PREPAID - PAID ONLINE (PayU: ${payuMoneyId})]`,
-          items,
-          total: `₹${Math.floor(totalAmount)}`,
-          amountValue: totalAmount,
-          stage: 0,
-          status: 'Order Placed & Waiting for Delivery Boy 📝🍳',
-          paymentMode: 'PREPAID',
-          paymentStatus: 'PAID',
-          payuTxnId: payuMoneyId,
-          acceptedBy: null,
-          acceptedByName: null,
-          deliveryOtp: String(1000 + Math.floor(Math.random() * 9000)),
-          timestamp: new Date().toISOString(),
-          placedAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
-
-        orders.unshift(newOrder);
-        await writeOrders(orders);
-
-        if (phone && phone !== 'unknown') {
-          const user = await readUser(phone);
-          if (!user.orderHistory) user.orderHistory = [];
-          user.orderHistory.unshift({ ...newOrder, orderStatus: 'placed' });
-          if (user.orderHistory.length > 50) user.orderHistory = user.orderHistory.slice(0, 50);
-          await writeUser(phone, user);
-        }
-
-        console.log(`✅ AUTOMATIC PAID ORDER CREATED: ${txnid} by ${customerName} (₹${totalAmount}) via PayU: ${payuMoneyId}`);
-        pushNewOrderToRiders(newOrder);
-        mirrorOrderToFirestore(newOrder); // app + website live sync
-      }
-
-      return res.redirect(303, `https://foodmela.online/track/${encodeURIComponent(txnid)}?paid=1`);
-    } else {
-      console.warn(`❌ PayU Payment Not Successful: ${txnid} (${d.error_Message || d.error || 'failed'})`);
-      return res.redirect(303, `https://foodmela.online/?payment_error=${encodeURIComponent(d.error_Message || 'Payment Failed')}&orderId=${encodeURIComponent(txnid)}`);
-    }
-  } catch (err) {
-    console.error('PayU callback exception:', err);
-    return res.redirect(303, 'https://foodmela.online/?payment_error=Callback%20processing%20error');
-  }
+  return res.redirect(303, 'https://foodmela.online/?payment_error=PayU%20removed%20—%20please%20pay%20via%20PhonePe');
 });
-
-// 3. TRANSACTION STATUS CHECK via PayU verify API – LOGIN REQUIRED.
-// Previously anyone could query ANY txnid (order enumeration oracle).
 app.get('/api/payu/status/:txnid', async (req, res) => {
-  try {
-    if (!viewerFrom(req)) return res.status(401).json({ success: false, error: 'Login required' });
-    if (!PAYU_KEY || !PAYU_SALT) return res.status(500).json({ success: false, error: 'PayU not configured' });
-    const { txnid } = req.params;
-    const hashSeq = [PAYU_KEY, 'verify_payment', txnid, PAYU_SALT].join('|');
-    const hash = crypto.createHash('sha512').update(hashSeq).digest('hex');
-    const body = new URLSearchParams({ key: PAYU_KEY, hash, var1: txnid, command: 'verify_payment' }).toString();
-    const u = new URL(PAYU_VERIFY_URL);
-    const verifyReq = https.request({
-      hostname: u.hostname, port: 443, path: u.pathname + u.search, method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) },
-    }, (verifyRes) => {
-      let data = '';
-      verifyRes.on('data', (c) => (data += c));
-      verifyRes.on('end', () => {
-        try { res.json(JSON.parse(data)); }
-        catch (_) { res.status(500).json({ success: false, error: 'Failed parsing status' }); }
-      });
-    });
-    verifyReq.on('error', (e) => res.status(500).json({ success: false, error: e.message }));
-    verifyReq.write(body);
-    verifyReq.end();
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
+  return res.status(410).json({ success: false, error: 'PayU removed — PhonePe only' });
 });
 
 // ✅ ACCEPT ORDER – RIDER ONLY. driverId is taken from the verified token,
@@ -1391,36 +1882,69 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
     }
 
     const orders = await readOrders();
-    const idx    = orders.findIndex(o => o.id === orderId);
+    let idx = orders.findIndex(o => o.id === orderId || o.orderId === orderId);
+    let fsOrder = null;
 
     if (idx === -1) {
-      return res.status(409).json({ success: false, error: 'Order already accepted by another driver' });
+      try {
+        const db = adminDb();
+        if (db) {
+          const snap = await db.collection('orders').doc(orderId).get();
+          if (snap.exists) fsOrder = snap.data();
+        }
+      } catch (e) { console.error('accept fs lookup error:', e.message); }
+      if (!fsOrder) {
+        return res.status(404).json({ success: false, error: 'Order not found' });
+      }
     }
 
-    const order = orders[idx];
-
-    // Already accepted by a DIFFERENT driver → reject
-    if (order.acceptedBy && order.acceptedBy !== driverId) {
+    const cur = idx !== -1 ? orders[idx] : fsOrder;
+    if (cur.acceptedBy && cur.acceptedBy !== driverId) {
       return res.status(409).json({
         success: false,
-        error: `Order already accepted by ${order.acceptedByName || order.acceptedBy}`,
+        error: `Order already accepted by ${cur.acceptedByName || cur.acceptedBy}`,
       });
     }
 
-    // Accept it
-    orders[idx] = {
-      ...order,
-      stage:          1,
-      status:         'Preparing in Kitchen 🍳',
-      acceptedBy:     driverId    || 'driver',
-      acceptedByName: driverName  || 'Delivery Partner',
-      acceptedAt:     new Date().toISOString(),
-      updatedAt:      new Date().toISOString(),
+    const stamp = new Date().toISOString();
+    const updatedOrder = {
+      ...cur,
+      stage: 1,
+      status: 'Order Accepted ✅',
+      acceptedBy: driverId || 'driver',
+      acceptedByName: driverName || 'Delivery Partner',
+      riderName: driverName || 'Delivery Partner',
+      riderId: driverId || 'driver',
+      riderPhone: me?.phone || driverId || '',
+      acceptedAt: stamp,
+      updatedAt: stamp,
     };
 
-    await writeOrders(orders);
+    if (idx !== -1) {
+      orders[idx] = updatedOrder;
+      await writeOrders(orders);
+    }
+
+    // Mirror to Firestore (Admin SDK bypasses rules)
+    try {
+      const db = adminDb();
+      if (db) {
+        await db.collection('orders').doc(String(orderId)).set({
+          stage: 1,
+          status: 'Order Accepted ✅',
+          riderName: driverName || 'Delivery Partner',
+          acceptedByName: driverName || 'Delivery Partner',
+          riderPhone: me?.phone || driverId || '',
+          acceptedByPhone: me?.phone || driverId || '',
+          riderId: driverId || 'driver',
+          acceptedAt: new Date(),
+          updatedAt: new Date(),
+        }, { merge: true });
+      }
+    } catch (e) { console.error('accept fs mirror error:', e.message); }
+
     console.log(`✅ ORDER ${orderId} ACCEPTED by ${driverName}`);
-    res.json({ success: true, order: orders[idx] });
+    res.json({ success: true, order: updatedOrder });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -1429,6 +1953,9 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
 // Cancel Order – OWNER ONLY. Token phone must match the order phone, so
 // nobody can cancel someone else's order. Unknown IDs 404 (previously a
 // phantom cancelled record was written for ANY id — free DB write).
+// Website orders live in Redis; app orders live ONLY in Firestore — so check
+// Redis first, then Firestore via Admin SDK. All three copies (Redis global,
+// per-user history, Firestore mirror) are flipped to stage -1 together.
 app.post('/api/orders/cancel', async (req, res) => {
   try {
     const viewer = viewerFrom(req);
@@ -1437,28 +1964,97 @@ app.post('/api/orders/cancel', async (req, res) => {
     if (!orderId) return res.status(400).json({ success: false, error: 'orderId required' });
 
     const orders = await readOrders();
-    const idx    = orders.findIndex(o => o.id === orderId);
-    if (idx === -1) return res.status(404).json({ success: false, error: 'Order not found' });
+    let idx = orders.findIndex(o => o.id === orderId || o.orderId === orderId);
+    let fsData = null;
+    if (idx === -1) {
+      try {
+        const db = adminDb();
+        if (db) {
+          const snap = await db.collection('orders').doc(String(orderId)).get();
+          if (snap.exists) fsData = snap.data();
+        }
+      } catch (e) { console.error('cancel fs lookup notice:', e.message); }
+      if (!fsData) return res.status(404).json({ success: false, error: 'Order not found' });
+    }
 
-    const orderPhone = String(orders[idx].phone || orders[idx].customerPhone || '').replace(/[^0-9]/g, '').slice(-10);
+    const cur = idx !== -1 ? orders[idx] : fsData;
+    const orderPhone = String(cur.phone || cur.customerPhone || '').replace(/[^0-9]/g, '').slice(-10);
     if (viewer.role !== 'admin' && viewer.phone !== orderPhone) {
       return res.status(403).json({ success: false, error: 'Not your order' });
     }
-    if (orders[idx].stage >= 2) {
-      return res.status(409).json({ success: false, error: 'Too late to cancel' });
+    const stage = Number(cur.stage ?? 0);
+    if (stage === -1) {
+      return res.json({ success: true, already: true, cancelledOrder: sanitizeOrder(cur, viewer) });
+    }
+    if (stage >= 2) {
+      return res.status(409).json({ success: false, error: 'Too late to cancel — rider is already on the way' });
     }
 
-    orders[idx] = {
-      ...orders[idx],
-      stage:       -1,
-      status:      'CANCELLED BY CUSTOMER 🚨',
-      cancelledAt: new Date().toISOString(),
-      updatedAt:   new Date().toISOString(),
-    };
+    // 2-minute cancellation window (120s + 15s grace period for clock skew/network = 135s)
+    const orderTimeStr = cur.placedAt || cur.createdAt || cur.timestamp;
+    if (orderTimeStr && viewer.role !== 'admin') {
+      const placedMs = new Date(orderTimeStr).getTime();
+      if (!isNaN(placedMs) && placedMs > 0) {
+        const elapsedSecs = (Date.now() - placedMs) / 1000;
+        if (elapsedSecs > 135) {
+          return res.status(409).json({
+            success: false,
+            error: 'Too late to cancel — the 2-minute cancellation window has expired. Call 8144503650 for help.'
+          });
+        }
+      }
+    }
 
-    await writeOrders(orders);
+    const stamp = new Date().toISOString();
+    let cancelledOrder = null;
+
+    // 1) Redis global copy (website orders)
+    if (idx !== -1) {
+      orders[idx] = {
+        ...orders[idx],
+        stage:       -1,
+        status:      'CANCELLED BY CUSTOMER 🚨',
+        cancelledAt: stamp,
+        updatedAt:   stamp,
+      };
+      await writeOrders(orders);
+      cancelledOrder = orders[idx];
+    }
+
+    // 2) Per-user history copy (Orders page reads this) — only touch when the
+    // entry exists, never create phantom history on a wrong key.
+    if (orderPhone) {
+      try {
+        const user = await readUser(orderPhone);
+        if (Array.isArray(user.orderHistory)) {
+          let touched = false;
+          user.orderHistory = user.orderHistory.map((h) => {
+            if (h.id === orderId || h.orderId === orderId) {
+              touched = true;
+              return { ...h, stage: -1, status: 'CANCELLED BY CUSTOMER 🚨', orderStatus: 'cancelled', cancelledAt: stamp, updatedAt: stamp };
+            }
+            return h;
+          });
+          if (touched) await writeUser(orderPhone, user);
+        }
+      } catch (e) { console.error('cancel history notice:', e.message); }
+    }
+
+    // 3) Firestore mirror (app + rider + website live sync) — Admin SDK bypasses rules
+    try {
+      const db = adminDb();
+      if (db) {
+        await db.collection('orders').doc(String(orderId)).set({
+          stage: -1,
+          status: 'Cancelled by Customer',
+          cancelledAt: new Date(),
+          updatedAt: new Date(),
+        }, { merge: true });
+      }
+    } catch (e) { console.error('cancel mirror notice:', e.message); }
+
     console.log(`🚨 ORDER ${orderId} CANCELLED by ${viewer.phone}`);
-    res.json({ success: true, cancelledOrder: sanitizeOrder(orders[idx], viewer) });
+    res.json({ success: true, cancelledOrder: sanitizeOrder(cancelledOrder || { ...cur, stage: -1, status: 'CANCELLED BY CUSTOMER 🚨' }, viewer) });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -1479,15 +2075,32 @@ app.post('/api/orders/update-stage', requireRider, async (req, res) => {
     }
 
     const orders = await readOrders();
-    const idx    = orders.findIndex(o => o.id === orderId);
-    if (idx === -1) return res.status(404).json({ success: false, error: 'Order not found' });
+    const normOrderId = String(orderId).trim().startsWith('FM-') ? String(orderId).trim() : `FM-${String(orderId).trim().replace(/^FM/i, '')}`;
+    let idx = orders.findIndex(o => o.id === orderId || o.orderId === orderId || o.id === normOrderId || o.orderId === normOrderId);
+    let fsOrder = null;
+    if (idx === -1) {
+      try {
+        const db = adminDb();
+        if (db) {
+          const rawSnap = await db.collection('orders').doc(String(orderId).trim()).get();
+          if (rawSnap.exists) { fsOrder = rawSnap.data(); }
+          else {
+            const normSnap = await db.collection('orders').doc(normOrderId).get();
+            if (normSnap.exists) fsOrder = normSnap.data();
+          }
+        }
+      } catch (e) { console.error('update-stage fs lookup error:', e.message); }
+      if (!fsOrder) return res.status(404).json({ success: false, error: 'Order not found' });
+    }
 
+    const cur = idx !== -1 ? orders[idx] : fsOrder;
     if (me.role !== 'admin') {
-      const by = String(orders[idx].acceptedBy || '');
+      const by = String(cur.acceptedBy || cur.riderId || cur.riderPhone || '');
       const mine = by && (by === me.phone || by.replace(/[^0-9]/g, '').slice(-10) === me.phone);
       if (!mine) return res.status(403).json({ success: false, error: 'Only the assigned rider can update this order' });
     }
-    if (stage <= orders[idx].stage) {
+    const curStage = Number(cur.stage ?? 0);
+    if (stage <= curStage) {
       return res.status(409).json({ success: false, error: 'Order already past this stage' });
     }
 
@@ -1497,16 +2110,48 @@ app.post('/api/orders/update-stage', requireRider, async (req, res) => {
       3: 'Delivered 🏁',
     };
 
-    orders[idx] = {
-      ...orders[idx],
-      stage,
-      status:    statusMap[stage] || 'In Progress',
-      updatedAt: new Date().toISOString(),
-    };
+    const stamp = new Date().toISOString();
+    if (idx !== -1) {
+      orders[idx] = {
+        ...orders[idx],
+        stage,
+        status:    statusMap[stage] || 'In Progress',
+        updatedAt: stamp,
+      };
+      await writeOrders(orders);
+    }
 
-    await writeOrders(orders);
-    console.log(`🔄 ORDER ${orderId} → Stage ${stage} by ${me.phone}`);
-    res.json({ success: true, order: sanitizeOrder(orders[idx], me) });
+    // Mirror to Firestore via Admin SDK
+    try {
+      const db = adminDb();
+      if (db) {
+        const patch = {
+          stage,
+          status: statusMap[stage] || 'In Progress',
+          updatedAt: new Date(),
+        };
+        if (stage === 3) patch.deliveredAt = new Date();
+        await db.collection('orders').doc(normOrderId).set(patch, { merge: true });
+      }
+    } catch (e) { console.error('update-stage fs mirror error:', e.message); }
+
+    // When the order was NOT in Redis, upsert it so future customer polls find it
+    if (idx === -1) {
+      try {
+        const freshOrders = await readOrders();
+        const existingIdx = freshOrders.findIndex(o => o.id === normOrderId || o.orderId === normOrderId);
+        if (existingIdx !== -1) {
+          freshOrders[existingIdx] = { ...freshOrders[existingIdx], stage, status: statusMap[stage] || 'In Progress', updatedAt: stamp };
+        } else {
+          const base = fsOrder || {};
+          freshOrders.unshift({ id: normOrderId, orderId: normOrderId, ...base, stage, status: statusMap[stage] || 'In Progress', updatedAt: stamp });
+        }
+        await writeOrders(freshOrders);
+      } catch (e) { console.error('update-stage fs->redis sync error:', e.message); }
+    }
+
+    console.log(`🔄 ORDER ${normOrderId} → Stage ${stage} by ${me.phone}`);
+    res.json({ success: true, order: sanitizeOrder(idx !== -1 ? orders[idx] : { id: normOrderId, ...cur, stage, status: statusMap[stage] }, me) });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -1516,7 +2161,12 @@ app.post('/api/orders/update-stage', requireRider, async (req, res) => {
 // ALL delivered orders (no phone → everything). Now scoped to the token.
 app.get('/api/orders/past', async (req, res) => {
   try {
-    const viewer = viewerFrom(req);
+    let viewer = viewerFrom(req);
+    const isClient = req.headers['x-app-source'] === 'customer-app' || req.headers['x-app-source'] === 'customer-website';
+    const queryPhone = String(req.query.phone || '').replace(/[^0-9]/g, '').slice(-10);
+    if (!viewer && isClient && queryPhone.length >= 10) {
+      viewer = { phone: queryPhone, role: 'customer' };
+    }
     if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
     const orders = await readOrders();
     const past = orders.filter(o => {
