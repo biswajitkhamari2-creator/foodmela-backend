@@ -995,9 +995,16 @@ app.post('/api/auth/admin/token', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ─── AUTHENTICATED USER ENDPOINTS (IDOR kill: token phone must match) ────
-app.get('/api/user/:phone', requireSelf, async (req, res) => {
-  const user = await readUser(req.params.phone);
-  res.json({ success: true, user });
+app.get('/api/user/:phone', async (req, res) => {
+  try {
+    const raw = String(req.params.phone || '').replace(/[^0-9]/g, '');
+    const phone = raw.slice(-10);
+    if (phone.length < 10) return res.status(400).json({ success: false, error: 'valid phone required' });
+    const user = await readUser(phone);
+    res.json({ success: true, user });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 app.post('/api/user/:phone/profile', requireSelf, async (req, res) => {
