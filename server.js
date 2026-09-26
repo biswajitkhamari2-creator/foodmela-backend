@@ -135,6 +135,72 @@ const serveSitemap = (req, res) => {
 app.get('/sitemap.xml', serveSitemap);
 app.get('/api/sitemap.xml', serveSitemap);
 
+// ─── 🛠️ SERVER-SIDE MAINTENANCE KILL-SWITCH ─────────────────────────────────
+// Purane installed apps (bina update) bhi band ho jayenge — server hi mana
+// kar dega. Flag Redis me: fm_maintenance_v1 = {"enabled":bool,"eta":str}.
+// Admin panel → Settings se toggle hota hai (same button, website + apps).
+// Website Firestore flag dekhta hai, apps + API ye Redis flag dekhte hain —
+// admin panel dono ko ek saath set karta hai.
+const MAINT_KEY = 'fm_maintenance_v1';
+let _maintCache = { enabled: false, eta: '30 min', at: 0 };
+async function getMaintenance() {
+  try {
+    // 10-sec cache — har request par Redis hit nahi.
+    if (Date.now() - _maintCache.at < 10000) return _maintCache;
+    const r = await upstashCommand(['GET', MAINT_KEY]);
+    if (r.result && r.result !== 'nil' && r.result !== null) {
+      const d = JSON.parse(r.result);
+      _maintCache = { enabled: d.enabled === true, eta: String(d.eta || '30 min'), at: Date.now() };
+    } else {
+      _maintCache = { enabled: false, eta: '30 min', at: Date.now() };
+    }
+  } catch (_) { /* fail-open: Redis down → site chalti rahe */ }
+  return _maintCache;
+}
+async function setMaintenance(enabled, eta) {
+  const d = { enabled: !!enabled, eta: String(eta || '30 min'), updatedAt: Date.now() };
+  await upstashCommand(['SET', MAINT_KEY, JSON.stringify(d)]);
+  _maintCache = { ...d, at: Date.now() };
+  return d;
+}
+// Public status — purane apps polling karke khud maintenance screen dikha sakte hain.
+app.get('/api/maintenance/status', async (req, res) => {
+  const m = await getMaintenance();
+  res.json({ success: true, enabled: m.enabled, eta: m.eta });
+});
+// Admin set — same isAdminCaller check jaise baaki admin endpoints.
+app.post('/api/admin/maintenance', async (req, res) => {
+  try {
+    const authHeader = String(req.headers.authorization || '');
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (!(await isAdminCaller(idToken))) {
+      return res.status(403).json({ success: false, error: 'admin only' });
+    }
+    const d = await setMaintenance(req.body.enabled, req.body.eta);
+    res.json({ success: true, ...d });
+  } catch (e) {
+    res.status(500).json({ success: false, error: 'save failed' });
+  }
+});
+// Kill-switch middleware — maintenance ON ho to SAARE /api endpoints 503 de
+// (GET + POST sab). Sirf /api/maintenance/status aur /api/admin/* khule rehte
+// hain taaki apps ETA dikha sakein aur admin panel kaam kare.
+app.use('/api/', async (req, res, next) => {
+  try {
+    if (req.path.startsWith('/admin/') || req.path === '/maintenance/status') return next();
+    const m = await getMaintenance();
+    if (m.enabled) {
+      return res.status(503).json({
+        success: false,
+        maintenance: true,
+        eta: m.eta,
+        error: '🛠️ Server under maintenance — thodi der me wapas aayenge',
+      });
+    }
+  } catch (_) { /* fail-open */ }
+  next();
+});
+
 
 const ORDERS_KEY    = 'fm_orders_v1';
 
@@ -145,7 +211,7 @@ const ORDERS_KEY    = 'fm_orders_v1';
 // phone to MATCH the requested phone — killing IDOR. Rider endpoints
 // (accept/update-stage) require a rider token minted at rider login.
 // Tokens are stateless (HMAC-SHA256, no storage) and expire after 7 days.
-const API_TOKEN_SECRET = process.env.API_TOKEN_SECRET || process.env.PAYU_SALT || '';
+const API_TOKEN_SECRET = process.env.API_TOKEN_SECRET || '';
 function _b64url(buf) {
   return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
@@ -182,29 +248,48 @@ function bearerToken(req) {
   return String(req.body?.apiToken || req.query?.apiToken || '').trim() || null;
 }
 // Require a valid token whose phone matches :phone param (IDOR kill).
-function requireSelf(req, res, next) {
-  const isAppSync = req.headers['x-app-source'] === 'customer-app' || req.headers['x-app-source'] === 'customer-website';
-  if (isAppSync) {
-    const target = String(req.params.phone || '').replace(/[^0-9]/g, '').slice(-10);
-    req.apiAuth = { phone: target, role: 'customer' };
-    return next();
-  }
-  const t = verifyApiToken(bearerToken(req));
-  const target = String(req.params.phone || '').replace(/[^0-9]/g, '').slice(-10);
-  if (!t || t.phone !== target) {
-    return res.status(401).json({ success: false, error: 'Login required' });
-  }
-  req.apiAuth = t;
+// NOTE: no x-app-source bypass here — that client-controlled header allowed
+// anyone to read ANY customer's profile/orders/history by phone number alone
+// (verified live). The apps always send a real Bearer apiToken (apiHeaders),
+// so legitimate clients are unaffected.
+//
+// 🛠️ Maintenance gate FIRST — server OFF ho to purane apps bhi band (503),
+// chahe token valid ho ya nahi. Admin + status endpoints kabhi block nahi.
+async function maintenanceGate(req, res, next) {
+  try {
+    const m = await getMaintenance();
+    if (m.enabled) {
+      return res.status(503).json({
+        success: false,
+        maintenance: true,
+        eta: m.eta,
+        error: '🛠️ Server under maintenance — thodi der me wapas aayenge',
+      });
+    }
+  } catch (_) { /* fail-open */ }
   next();
+}
+function requireSelf(req, res, next) {
+  maintenanceGate(req, res, () => {
+    const t = verifyApiToken(bearerToken(req));
+    const target = String(req.params.phone || '').replace(/[^0-9]/g, '').slice(-10);
+    if (!t || t.phone !== target) {
+      return res.status(401).json({ success: false, error: 'Login required' });
+    }
+    req.apiAuth = t;
+    next();
+  });
 }
 // Require rider (or admin) role for rider-mutation endpoints.
 function requireRider(req, res, next) {
-  const t = verifyApiToken(bearerToken(req));
-  if (!t || (t.role !== 'rider' && t.role !== 'admin')) {
-    return res.status(401).json({ success: false, error: 'Rider login required' });
-  }
-  req.apiAuth = t;
-  next();
+  maintenanceGate(req, res, () => {
+    const t = verifyApiToken(bearerToken(req));
+    if (!t || (t.role !== 'rider' && t.role !== 'admin')) {
+      return res.status(401).json({ success: false, error: 'Rider login required' });
+    }
+    req.apiAuth = t;
+    next();
+  });
 }
 // Strip sensitive fields from orders served to non-owners. Owners prove
 // ownership with their token phone == order phone; riders see operational
@@ -466,34 +551,52 @@ app.post('/api/calls/:orderId/ring', async (req, res) => {
     const { callId, callerRole, receiverToken } = req.body || {};
     const viewer = viewerFrom(req);
     if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
-    const orders = await readOrders();
-    const order = orders.find(o => o.id === orderId);
+    // Lookup: Redis first, then Firestore via Admin SDK (app orders live ONLY
+    // in Firestore — Redis-only lookup 404'd every Firestore-only order, so
+    // the incoming-call push never fired).
+    let order = null;
+    try {
+      const orders = await readOrders();
+      order = orders.find(o => o.id === orderId || o.orderId === orderId) || null;
+    } catch (_) {}
+    let fsData = null;
+    if (!order) {
+      try {
+        const db = adminDb();
+        if (db) {
+          const snap = await db.collection('orders').doc(String(orderId)).get();
+          if (snap.exists) {
+            fsData = snap.data() || {};
+            order = { id: orderId, ...fsData };
+          }
+        }
+      } catch (e) { console.error('ring fs lookup notice:', e.message); }
+    }
     if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
     const orderPhone = String(order.phone || order.customerPhone || '').replace(/[^0-9]/g, '').slice(-10);
-    const by = String(order.acceptedBy || '');
+    // All rider-id shapes the two accept writers stamp (phone, partnerId,
+    // riderPhone, acceptedByPhone, riderPartnerId). A rider is a member only
+    // when their verified token phone matches one of them — never any rider
+    // on any order (that allowed call-push spam on unassigned orders).
+    const riderIds = [order.acceptedBy, order.riderId, order.riderPhone,
+      order.acceptedByPhone, order.riderPartnerId].map((v) => String(v || ''));
+    const riderMatch = viewer.role === 'rider' && riderIds.some((id) =>
+      id !== '' && (id === viewer.phone
+        || (id.replace(/[^0-9]/g, '').slice(-10) === viewer.phone
+          && viewer.phone.replace(/[^0-9]/g, '').length >= 10)));
     const isMember = viewer.role === 'admin'
       || viewer.phone === orderPhone
-      || (by && (by === viewer.phone || by.replace(/[^0-9]/g, '').slice(-10) === viewer.phone));
+      || riderMatch;
     if (!isMember) return res.status(403).json({ success: false, error: 'Not part of this order' });
     const otherRole = callerRole === 'customer' ? 'rider' : 'customer';
     let token = (receiverToken || '').trim();
     if (!token) {
-      // Read receiver token from the Firestore order doc (public read rule)
+      // Receiver token from the already-fetched order (Redis or Admin-SDK
+      // Firestore read above). The old unauthenticated REST read 403'd under
+      // hardened rules, so the push silently never fired.
       try {
-        const path = `/v1/projects/${process.env.FIRESTORE_PROJECT_ID || 'food-mela-notification'}/databases/(default)/documents/orders/${encodeURIComponent(orderId)}`;
-        const doc = await new Promise((resolve) => {
-          const r = https.request({ hostname: 'firestore.googleapis.com', path, method: 'GET' }, (rs) => {
-            let d = '';
-            rs.on('data', (c) => { d += c; });
-            rs.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
-          });
-          r.on('error', () => resolve(null));
-          r.setTimeout(8000, () => { r.destroy(); resolve(null); });
-          r.end();
-        });
-        const f = (doc && doc.fields) || {};
         const key = otherRole === 'rider' ? 'riderFcmToken' : 'customerFcmToken';
-        token = (f[key] && f[key].stringValue) || '';
+        token = String((fsData && fsData[key]) || order[key] || '').trim();
       } catch (_) {}
     }
     if (!token) return res.json({ success: true, pushed: false, reason: 'no receiver token yet' });
@@ -596,6 +699,35 @@ async function writeOrders(orders) {
   }
 }
 
+// ─── ORDER STATUS AUTHORITY (server-side source of truth) ────────────────────
+// ONE ORDER → ONE SERVER STATE → ALL CLIENTS SEE THE SAME STATE.
+// Every mutation goes through applyStatusTransition(): it re-reads the latest
+// persisted record, validates the transition against the CURRENT server state
+// (never the caller's claimed state), bumps a monotonic version, appends a
+// history entry, and returns the confirmed record. Clients must render ONLY
+// the `order` object returned by the API — never their local guess.
+const FINAL_STAGES = [3, -1];
+function isFinalStage(s) { return FINAL_STAGES.includes(Number(s)); }
+// Allowed forward transitions only. Cancel (-1) is handled by /cancel.
+const ALLOWED_TRANSITIONS = { 0: [1], 1: [2], 2: [3] };
+function transitionAllowed(from, to) {
+  return (ALLOWED_TRANSITIONS[Number(from)] || []).includes(Number(to));
+}
+function appendStatusHistory(order, { from, to, fromStatus, toStatus, actor, actorName, opId }) {
+  const hist = Array.isArray(order.statusHistory) ? order.statusHistory.slice(-49) : [];
+  hist.push({
+    from, to, fromStatus: fromStatus || null, toStatus: toStatus || null,
+    actor: actor || null, actorName: actorName || null, opId: opId || null,
+    at: new Date().toISOString(),
+  });
+  return hist;
+}
+// Idempotency: same opId replayed → return current server state, no duplicate write.
+function findOrderByOpId(orders, opId) {
+  if (!opId) return -1;
+  return orders.findIndex(o => Array.isArray(o.statusHistory) && o.statusHistory.some(h => h.opId === opId));
+}
+
 // ─── ROOT HEALTH CHECK ────────────────────────────────────────────────────────
 app.get('/', async (req, res) => {
   const orders = await readOrders();
@@ -646,7 +778,7 @@ app.get('/api/diag/test-push', async (req, res) => {
 // Env: reuses FCM_SERVICE_ACCOUNT (same Firebase project service account).
 let _adminApp = null;
 // ─── FIRESTORE MIRROR (app ↔ website live sync) ─────────────────────────────
-// Every website order (COD place-order + PayU callback) is mirrored to the
+// Every website order (COD place-order + PhonePe callback) is mirrored to the
 // Firestore `orders` collection via the Admin SDK (bypasses rules), so the
 // customer app, rider app, and website track the SAME doc in real time.
 // Best-effort: Redis is the source of truth; a failed mirror never fails
@@ -780,7 +912,7 @@ app.post('/api/admin/riders/reset-password', async (req, res) => {
 // verifies the token, checks the users/{uid} doc is an approved + unblocked
 // delivery_partner, and mints a rider apiToken bound to the rider's phone.
 // Rate-limited (auth limiter) + brute-force safe (Firebase throttles).
-app.post('/api/auth/rider/token', async (req, res) => {
+app.post('/api/auth/rider/token', maintenanceGate, async (req, res) => {
   try {
     const authHeader = String(req.headers.authorization || '');
     const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : String(req.body.idToken || '');
@@ -869,12 +1001,65 @@ app.get('/api/user/:phone', requireSelf, async (req, res) => {
 });
 
 app.post('/api/user/:phone/profile', requireSelf, async (req, res) => {
-  const phone = req.params.phone;
-  const user = await readUser(phone);
-  if (req.body.name) user.name = String(req.body.name).slice(0, 80);
-  if (req.body.email) user.email = String(req.body.email).slice(0, 120);
-  await writeUser(phone, user);
-  res.json({ success: true, user });
+  try {
+    const raw = String(req.params.phone || '').replace(/[^0-9]/g, '');
+    const phone = raw.slice(-10);
+    if (phone.length < 10) return res.status(400).json({ success: false, error: 'valid phone required' });
+    const user = await readUser(phone);
+    // Conflict guard: stale writes (older updatedAt than stored) are rejected
+    // so two devices editing at once can't silently clobber the newer name.
+    const clientTs = Number(req.body.updatedAt || req.body.clientTs || 0);
+    const storedTs = Number(user.updatedAt || 0);
+    if (clientTs && storedTs && clientTs < storedTs) {
+      return res.status(409).json({ success: false, error: 'profile changed elsewhere — refreshed', user });
+    }
+    const cleanName = String(req.body.name ?? '').trim();
+    if (req.body.name !== undefined) {
+      if (cleanName.length < 2) return res.status(400).json({ success: false, error: 'Enter a valid name' });
+      user.name = cleanName.slice(0, 80);
+      user.fullName = user.name;
+      const parts = user.name.split(/\s+/);
+      user.firstName = parts[0] || '';
+      user.lastName = parts.slice(1).join(' ') || '';
+    }
+    if (req.body.email !== undefined) user.email = String(req.body.email).slice(0, 120);
+    if (req.body.address !== undefined) {
+      const addr = String(req.body.address).trim();
+      if (addr) {
+        user.addresses = Array.isArray(user.addresses) ? user.addresses : [];
+        if (!user.addresses.some((a) => a.address === addr)) {
+          user.addresses.unshift({ title: 'Website 🏠', address: addr.slice(0, 300) });
+        }
+      }
+    }
+    user.role = user.role || 'customer';
+    user.accountStatus = user.accountStatus || 'active';
+    user.approvalStatus = user.approvalStatus || 'approved';
+    user.updatedAt = Date.now();
+    await writeUser(phone, user);
+    // Mirror to Firestore users/{phone} so the admin panel + apps see the
+    // new name on their existing onSnapshot listeners within ~1s.
+    // Uses adminDb() (firestore handle), NOT adminAuth() (auth handle).
+    try {
+      const db = adminDb();
+      if (db) {
+        const topAddr = (user.addresses && user.addresses[0] && user.addresses[0].address) || user.address || '';
+        await db.collection('users').doc(phone).set({
+          phone,
+          name: user.name || '',
+          fullName: user.fullName || user.name || '',
+          deliveryAddress: topAddr,
+          address: topAddr,
+          role: 'customer',
+          approvalStatus: 'approved',
+          updatedAt: new Date(),
+        }, { merge: true });
+      }
+    } catch (e) { console.error('profile firestore mirror notice:', e.message); }
+    res.json({ success: true, user });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 // Website OTP verification proxy — eapi.phone.email rejects browser-origin
@@ -882,15 +1067,15 @@ app.post('/api/user/:phone/profile', requireSelf, async (req, res) => {
 // (server-to-server, no CORS) exchanges it for the verified phone number.
 const PE_CLIENT_ID = '14442678863809499061';
 
-function postJson(urlStr, payload) {
+function postForm(urlStr, payload) {
   return new Promise((resolve, reject) => {
     const u = new URL(urlStr);
-    const body = JSON.stringify(payload);
+    const body = new URLSearchParams(payload).toString();
     const req = https.request({
       hostname: u.hostname,
       path: u.pathname,
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) },
     }, (res) => {
       let data = '';
       res.on('data', chunk => { data += chunk; });
@@ -927,7 +1112,7 @@ function getJson(urlStr) {
   });
 }
 
-app.post('/api/auth/phone-email/verify', async (req, res) => {
+app.post('/api/auth/phone-email/verify', maintenanceGate, async (req, res) => {
   try {
     // Official widget flow: the button's phoneEmailListener hands the website
     // a user_json_url, which only a server may fetch (browser CORS blocked).
@@ -945,10 +1130,9 @@ app.post('/api/auth/phone-email/verify', async (req, res) => {
       if (phone.length < 10) {
         return res.status(401).json({ success: false, error: 'verification failed' });
       }
-      if (!otpPhoneAllowed(phone)) {
-        res.setHeader('Retry-After', '120');
-        return res.status(429).json({ success: false, error: 'OTP already sent — wait 2 minutes before retrying' });
-      }
+      // NOTE: no per-phone cooldown here — phone.email already proved
+      // ownership via OTP; throttling verify/mint breaks re-login + silent
+      // re-mint. Abuse is still capped by the per-IP rate limiter above.
       const first = String(data.user_first_name ?? '').trim();
       const last = String(data.user_last_name ?? '').trim();
       let name = `${first} ${last}`.trim();
@@ -966,7 +1150,7 @@ app.post('/api/auth/phone-email/verify', async (req, res) => {
     // Legacy redirect flow: access_token exchange (kept as fallback)
     const accessToken = String(req.body.access_token || '').trim();
     if (!accessToken) return res.status(400).json({ success: false, error: 'access_token required' });
-    const data = await postJson('https://eapi.phone.email/getuser', {
+    const data = await postForm('https://eapi.phone.email/getuser', {
       access_token: accessToken,
       client_id: PE_CLIENT_ID,
     });
@@ -975,10 +1159,7 @@ app.post('/api/auth/phone-email/verify', async (req, res) => {
     if (data.status !== 200 || phone.length < 10) {
       return res.status(401).json({ success: false, error: 'verification failed' });
     }
-    if (!otpPhoneAllowed(phone)) {
-      res.setHeader('Retry-After', '120');
-      return res.status(429).json({ success: false, error: 'OTP already sent — wait 2 minutes before retrying' });
-    }
+    // NOTE: no per-phone cooldown here — same reason as the official flow.
     const first = String(data.first_name || data.user_first_name || '').trim();
     const last = String(data.last_name || data.user_last_name || '').trim();
     let name = `${first} ${last}`.trim();
@@ -997,10 +1178,34 @@ app.post('/api/auth/phone-email/verify', async (req, res) => {
   }
 });
 
+// Session refresh — re-mint apiToken from a live Firebase Auth session.
+// The apps sign into Firebase at login with the backend-minted custom token
+// (uid = verified 10-digit phone). That Firebase session outlives the
+// single-use phone.email access_token, so silent re-mint (calls, order sync)
+// uses THIS endpoint instead of re-posting the dead pe token — no cooldown,
+// no forced logout/login. Abuse is capped by the per-IP rate limiter.
+app.post('/api/auth/refresh', async (req, res) => {
+  try {
+    const authHeader = String(req.headers.authorization || '');
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : String(req.body.idToken || '');
+    if (!idToken) return res.status(401).json({ success: false, error: 'Firebase login required' });
+    const authAdmin = adminAuth();
+    if (!authAdmin) return res.status(500).json({ success: false, error: 'auth service not configured' });
+    let decoded;
+    try { decoded = await authAdmin.verifyIdToken(idToken); }
+    catch { return res.status(401).json({ success: false, error: 'Invalid session — login again' }); }
+    const phone = String(decoded.uid || '').replace(/[^0-9]/g, '').slice(-10);
+    if (phone.length < 10) return res.status(401).json({ success: false, error: 'Invalid session — login again' });
+    return res.json({ success: true, phone, apiToken: mintApiToken(phone, 'customer') });
+  } catch (e) {
+    res.status(502).json({ success: false, error: e.message || 'refresh failed' });
+  }
+});
+
 // Website OTP registration — phone.email verified the number, so create the
 // Redis profile (same store the apps use). Firestore users/{phone} is written
 // by the apps when they next see this number; website never writes Firestore.
-app.post('/api/user/register', async (req, res) => {
+app.post('/api/user/register', maintenanceGate, async (req, res) => {
   try {
     const raw = String(req.body.phone || '').replace(/[^0-9]/g, '');
     const phone = raw.slice(-10);
@@ -1008,11 +1213,10 @@ app.post('/api/user/register', async (req, res) => {
     // BOT BLOCK: register needs the OTP-minted token for THIS phone — bots
     // can't create profiles for numbers they never verified.
     const viewer = viewerFrom(req);
-    const isAppSync = req.headers['x-app-source'] === 'customer-app';
-    if (!isAppSync && (!viewer || (viewer.role !== 'customer' && viewer.role !== 'admin'))) {
+    if (!viewer || (viewer.role !== 'customer' && viewer.role !== 'admin')) {
       return res.status(401).json({ success: false, error: 'Verify OTP first' });
     }
-    if (!isAppSync && viewer && viewer.role !== 'admin' && viewer.phone !== phone) {
+    if (viewer.role !== 'admin' && viewer.phone !== phone) {
       return res.status(403).json({ success: false, error: 'Phone must be your own number' });
     }
     const user = await readUser(phone);
@@ -1037,6 +1241,22 @@ app.post('/api/user/register', async (req, res) => {
       return res.status(403).json({ success: false, error: 'account blocked' });
     }
     await writeUser(phone, user);
+    try {
+      const db = adminDb();
+      if (db) {
+        const topAddr = (user.addresses && user.addresses[0] && user.addresses[0].address) || user.address || '';
+        await db.collection('users').doc(phone).set({
+          phone,
+          name: user.name || '',
+          fullName: user.fullName || user.name || '',
+          deliveryAddress: topAddr,
+          address: topAddr,
+          role: 'customer',
+          approvalStatus: 'approved',
+          updatedAt: new Date(),
+        }, { merge: true });
+      }
+    } catch (e) { console.error('register firestore mirror notice:', e.message); }
     res.json({ success: true, user: { phone, name: user.name || '', address: (req.body.address || '').trim() } });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
@@ -1156,19 +1376,38 @@ const placeOrderHandler = async (req, res) => {
     const { customerName, phone, address, items, totalAmount } = req.body || {};
     const orderPhone = String(phone || '').replace(/[^0-9]/g, '').slice(-10);
     let viewer = viewerFrom(req);
-    const isAppSync = req.headers['x-app-source'] === 'customer-app' || req.headers['x-app-source'] === 'customer-website';
-    if (!viewer && orderPhone.length >= 10 && (isAppSync || !req.headers.authorization)) {
+    // Unauthenticated website callers (no Authorization header at all) may
+    // place for the stated phone — the website has no token until OTP verify.
+    // A bare client-controlled header is NOT enough (it allowed impersonating
+    // any phone); a forged Bearer token still fails verifyApiToken below.
+    if (!viewer && orderPhone.length >= 10 && !req.headers.authorization) {
       viewer = { phone: orderPhone, role: 'customer' };
     }
-    if (!isAppSync && (!viewer || (viewer.role !== 'customer' && viewer.role !== 'admin'))) {
+    if (!viewer || (viewer.role !== 'customer' && viewer.role !== 'admin')) {
       return res.status(401).json({ success: false, error: 'Login required' });
     }
-    if (!isAppSync && viewer && viewer.role !== 'admin' && viewer.phone !== orderPhone) {
+    if (viewer.role !== 'admin' && viewer.phone !== orderPhone) {
       return res.status(403).json({ success: false, error: 'Phone must be your own number' });
     }
     const amountNum = Number(totalAmount || 0);
     if (!amountNum || amountNum <= 0 || amountNum > 50000) {
       return res.status(400).json({ success: false, error: 'Valid totalAmount required' });
+    }
+
+    // Security Gate: Direct order placement (/api/orders/place) is ONLY allowed for COD <= ₹100.
+    // Prepaid orders MUST go through /api/phonepe/initiate and receive gateway verification callback.
+    const addrUpper = String(address || '').toUpperCase();
+    if (addrUpper.includes('[PREPAID]')) {
+      return res.status(403).json({
+        success: false,
+        error: 'Prepaid orders must be completed through PhonePe Payment Gateway.',
+      });
+    }
+    if (amountNum > 100 && !addrUpper.includes('[COD]')) {
+      return res.status(403).json({
+        success: false,
+        error: 'Orders above ₹100 must be paid online via PhonePe Gateway.',
+      });
     }
     let rawId = String(req.body.id || req.body.orderId || '').trim();
     if (!rawId) {
@@ -1230,8 +1469,8 @@ const placeOrderHandler = async (req, res) => {
   }
 };
 
-app.post('/api/orders/place', placeOrderHandler);
-app.post('/api/orders/create', placeOrderHandler);
+app.post('/api/orders/place', maintenanceGate, placeOrderHandler);
+app.post('/api/orders/create', maintenanceGate, placeOrderHandler);
 
 // ─── PHONEPE PG v2 INTEGRATION (Standard Checkout) ───────────────────────────
 // Secrets ONLY from env (Vercel → Settings → Environment Variables):
@@ -1240,7 +1479,7 @@ app.post('/api/orders/create', placeOrderHandler);
 //   PHONEPE_CLIENT_VERSION = usually "1" (as shown in dashboard)
 //   PHONEPE_ENV           = 'production' (live) or 'uat' (sandbox testing)
 //   PHONEPE_CALLBACK_URL  = https://foodmela.online/api/phonepe/callback (override ok)
-// PayU endpoints below are KEPT as fallback — nothing removed.
+// PhonePe PG v2 is the ONLY prepaid gateway — PayU fully removed.
 const PHONEPE_CLIENT_ID = process.env.PHONEPE_CLIENT_ID || '';
 const PHONEPE_CLIENT_SECRET = process.env.PHONEPE_CLIENT_SECRET || '';
 const PHONEPE_CLIENT_VERSION = process.env.PHONEPE_CLIENT_VERSION || '1';
@@ -1254,6 +1493,13 @@ const PHONEPE_PAY_URL = PHONEPE_ENV === 'production'
 const PHONEPE_STATUS_URL = PHONEPE_ENV === 'production'
   ? 'https://api.phonepe.com/apis/pg/checkout/v2/order'
   : 'https://api-preprod.phonepe.com/apis/pg-sandbox/checkout/v2/order';
+// SDK-order endpoint (native Android SDK / Flutter phonepe_payment_sdk flow).
+// Same auth + payload as /pay, but WITHOUT paymentFlow.merchantUrls — the SDK
+// renders its own sheet inside the app and returns to it directly. Response
+// carries orderId + token for startTransaction.
+const PHONEPE_SDK_ORDER_URL = PHONEPE_ENV === 'production'
+  ? 'https://api.phonepe.com/apis/pg/checkout/v2/sdk/order'
+  : 'https://api-preprod.phonepe.com/apis/pg-sandbox/checkout/v2/sdk/order';
 if (!PHONEPE_CLIENT_ID || !PHONEPE_CLIENT_SECRET) {
   console.warn('⚠️ PHONEPE_CLIENT_ID/SECRET missing — PhonePe checkout disabled until set in env');
 }
@@ -1320,7 +1566,15 @@ async function phonepeToken() {
   const token = json.access_token || json.encrypted_access_token;
   if (!token) throw new Error('PhonePe auth failed');
   _ppToken = token;
-  _ppTokenExp = now + Number(json.expires_at || json.expires_in || 3600) * 1000;
+  // expires_at is an ABSOLUTE epoch timestamp (seconds or ms); expires_in is
+  // a RELATIVE lifetime in seconds. The old code treated expires_at as a
+  // duration and added Date.now() to it, caching a dead token for years.
+  const rawExp = Number(json.expires_at ?? json.expires_in ?? 3600);
+  if (json.expires_at != null) {
+    _ppTokenExp = rawExp > 1e12 ? rawExp : rawExp > 1e9 ? rawExp * 1000 : now + rawExp * 1000;
+  } else {
+    _ppTokenExp = now + rawExp * 1000;
+  }
   return _ppToken;
 }
 async function phonepeOrderStatus(merchantOrderId) {
@@ -1342,7 +1596,7 @@ async function phonepeOrderStatus(merchantOrderId) {
     req.end();
   });
 }
-// Shared paid-order writer — same shape as PayU callback (COD/cart/rider/admin untouched).
+// Shared paid-order writer — same shape as PhonePe callback (COD/cart/rider/admin untouched).
 async function createPaidOrder({ txnid, customerName, phone, address, items, totalAmount, gatewayRef, gateway }) {
   let normalizedTxnid = String(txnid || '').trim();
   if (!normalizedTxnid.startsWith('FM-')) {
@@ -1365,7 +1619,7 @@ async function createPaidOrder({ txnid, customerName, phone, address, items, tot
     status: 'Order Placed & Waiting for Delivery Boy 📝🍳',
     paymentMode: 'PREPAID',
     paymentStatus: 'PAID',
-    payuTxnId: gatewayRef,
+    gatewayTxnId: gatewayRef,
     paymentGateway: gateway,
     acceptedBy: null,
     acceptedByName: null,
@@ -1410,7 +1664,7 @@ async function logPayment(entry) {
       amount: Number(entry.amountValue ?? entry.totalAmount ?? entry.amount ?? 0),
       gateway: String(entry.paymentGateway || entry.gateway || 'COD'),
       payStatus: String(entry.payStatus || entry.paymentStatus || 'PENDING'),
-      gatewayRef: String(entry.payuTxnId || entry.gatewayRef || ''),
+      gatewayRef: String(entry.gatewayTxnId || entry.payuTxnId || entry.gatewayRef || ''),
       at: new Date().toISOString(),
     };
     const raw = await upstashCommand(['GET', PAYMENTS_KEY]);
@@ -1436,7 +1690,7 @@ async function readPayments() {
 }
 // Admin-only payment trail. Same admin apiToken guard as other admin reads.
 // Merges THREE sources so history is never empty:
-//  1) gateway ledger (verified PhonePe/PayU states + refunds),
+//  1) gateway ledger (verified PhonePe states + refunds),
 //  2) Firestore orders via Admin SDK (rules bypassed — full history + COD),
 //  3) Redis website orders (stage/amount fallback).
 // Ledger wins per orderId; the rest fill the gaps.
@@ -1476,7 +1730,7 @@ function orderPayRec(o) {
     amount: Number(o.amountValue ?? o.totalAmount ?? 0),
     gateway,
     payStatus,
-    gatewayRef: String(o.payuTxnId || ''),
+    gatewayRef: String(o.gatewayTxnId || o.payuTxnId || ''),
     at: String(at || ''),
   };
 }
@@ -1621,29 +1875,38 @@ app.post('/api/admin/payments/refund/:txnid', async (req, res) => {
   }
 });
 
-// 1. INITIATE — returns the PhonePe checkout redirect URL (website navigates,
-// app opens it in the payment WebView). Draft saved for callback reconstruction.
-app.post('/api/phonepe/initiate', async (req, res) => {
+// ─── PHONEPE PG v2 — FRESH INTEGRATION FROM BASE (sole prepaid gateway) ─────
+// Official Standard Checkout flow (PhonePe PG docs):
+//   1. Server fetches OAuth token (identity-manager, client_credentials).
+//   2. Server POSTs /pg/checkout/v2/pay { merchantOrderId, amount(paise),
+//      paymentFlow: { type: 'PG_CHECKOUT', merchantUrls: { redirectUrl } } }
+//      with `O-Bearer <token>` → PhonePe returns redirectUrl.
+//   3. Customer pays on PhonePe hosted page → returns to /api/phonepe/return,
+//      which re-checks order status server-side (never trusts redirect alone)
+//      and creates the paid order only on COMPLETED.
+// Auth: logged-in customer token (Bearer/apiToken) OR guest checkout — the
+// app always sends its session token; the website sends none (guest allowed).
+// 1. INITIATE — validates input, saves a draft, returns the PhonePe checkout URL.
+app.post('/api/phonepe/initiate', maintenanceGate, async (req, res) => {
   try {
     if (!PHONEPE_CLIENT_ID || !PHONEPE_CLIENT_SECRET) {
       return res.status(500).json({ success: false, error: 'PhonePe not configured — contact support' });
     }
     const { customerName, phone, address, items, totalAmount } = req.body || {};
     const orderPhone = String(phone || '').replace(/[^0-9]/g, '').slice(-10);
-    let viewer = viewerFrom(req);
-    const isClient = req.headers['x-app-source'] === 'customer-app' || req.headers['x-app-source'] === 'customer-website';
-    if (!viewer && orderPhone.length >= 10 && (isClient || !req.headers.authorization)) {
-      viewer = { phone: orderPhone, role: 'customer' };
+    if (orderPhone.length < 10) {
+      return res.status(400).json({ success: false, error: 'Valid 10-digit phone required' });
     }
-    if (!viewer || (viewer.role !== 'customer' && viewer.role !== 'admin')) {
-      return res.status(401).json({ success: false, error: 'Login required' });
+    const viewer = viewerFrom(req);
+    if (viewer && viewer.role !== 'customer' && viewer.role !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Customers only' });
+    }
+    if (viewer && viewer.role === 'customer' && viewer.phone !== orderPhone) {
+      return res.status(403).json({ success: false, error: 'Phone must be your own number' });
     }
     const amountNum = Number(totalAmount || 0);
     if (!amountNum || amountNum <= 0 || amountNum > 50000) {
-      return res.status(400).json({ success: false, error: 'Valid totalAmount required' });
-    }
-    if (viewer.role !== 'admin' && viewer.phone !== orderPhone) {
-      return res.status(403).json({ success: false, error: 'Phone must be your own number' });
+      return res.status(400).json({ success: false, error: 'Valid totalAmount required (₹1–₹50000)' });
     }
     let txnid = String(req.body.orderId || req.body.id || '').trim();
     if (!txnid) {
@@ -1655,7 +1918,7 @@ app.post('/api/phonepe/initiate', async (req, res) => {
     await saveDraftOrder(txnid, {
       orderId: txnid,
       customerName: String(customerName || 'Customer').slice(0, 60),
-      phone: phone || 'unknown',
+      phone: orderPhone,
       address: address || 'Birmaharajpur',
       items: items || 'Food items',
       totalAmount: amountNum,
@@ -1663,39 +1926,121 @@ app.post('/api/phonepe/initiate', async (req, res) => {
       createdAt: new Date().toISOString(),
     });
     const redirectUrl = `https://foodmela.online/api/phonepe/return?orderId=${encodeURIComponent(txnid)}`;
-    const token = await phonepeToken();
-    const { status, json } = await ppPostJson(PHONEPE_PAY_URL, {
-      merchantOrderId: txnid,
-      amount: amountPaise,
-      paymentFlow: {
-        type: 'PG_CHECKOUT',
-        message: 'FoodMela Order Payment',
-        merchantUrls: { redirectUrl },
-        paymentModeConfig: {
-          version: 'V2',
-          disabledPaymentModes: [
-            {
-              type: 'UPI',
-              flows: ['QR'],
-            },
-          ],
+    let token;
+    try {
+      token = await phonepeToken();
+    } catch (e) {
+      console.error('PhonePe OAuth failed:', e.message);
+      return res.status(502).json({ success: false, error: 'Payment gateway auth failed — try again' });
+    }
+    let status, json;
+    try {
+      ({ status, json } = await ppPostJson(PHONEPE_PAY_URL, {
+        merchantOrderId: txnid,
+        amount: amountPaise,
+        paymentFlow: {
+          type: 'PG_CHECKOUT',
+          message: 'FoodMela Order Payment',
+          merchantUrls: { redirectUrl },
         },
-      },
-    }, token);
+      }, token));
+    } catch (e) {
+      console.error('PhonePe pay call failed:', e.message);
+      return res.status(502).json({ success: false, error: 'PhonePe could not start payment — try again' });
+    }
     const redirect = json.redirectUrl || json?.data?.redirectUrl;
     if (status !== 200 || !redirect) {
-      console.error('PhonePe pay failed:', status, JSON.stringify(json).slice(0, 300));
+      console.error('PhonePe pay rejected:', status, JSON.stringify(json).slice(0, 300));
       try {
-        await logPayment({ id: txnid, orderId: txnid, customerName, phone, amount: amountNum, gateway: 'PhonePe', payStatus: 'INIT_FAILED' });
+        await logPayment({ id: txnid, orderId: txnid, customerName, phone: orderPhone, amount: amountNum, gateway: 'PhonePe', payStatus: 'INIT_FAILED' });
       } catch (_) { /* ledger best-effort */ }
       return res.status(502).json({ success: false, error: 'PhonePe could not start payment — try again' });
     }
     try {
-      await logPayment({ id: txnid, orderId: txnid, customerName, phone, amount: amountNum, gateway: 'PhonePe', payStatus: 'INITIATED' });
+      await logPayment({ id: txnid, orderId: txnid, customerName, phone: orderPhone, amount: amountNum, gateway: 'PhonePe', payStatus: 'INITIATED' });
     } catch (_) { /* ledger best-effort */ }
     return res.json({ success: true, orderId: txnid, redirectUrl: redirect, gateway: 'phonepe', apiToken: mintApiToken(orderPhone, 'customer') });
   } catch (err) {
     console.error('PhonePe initiate exception:', err.message);
+    res.status(500).json({ success: false, error: 'Payment gateway unreachable — try again' });
+  }
+});
+
+// 1b. SDK-ORDER — for the native Android SDK (phonepe_payment_sdk plugin).
+// Same validation + draft as /initiate, but calls the SDK order API (no
+// redirectUrl involved) and returns { orderId, token } for startTransaction.
+// The app verifies the final state via /api/phonepe/status/:txnid.
+app.post('/api/phonepe/sdk-order', maintenanceGate, async (req, res) => {
+  try {
+    if (!PHONEPE_CLIENT_ID || !PHONEPE_CLIENT_SECRET) {
+      return res.status(500).json({ success: false, error: 'PhonePe not configured — contact support' });
+    }
+    const { customerName, phone, address, items, totalAmount } = req.body || {};
+    const orderPhone = String(phone || '').replace(/[^0-9]/g, '').slice(-10);
+    if (orderPhone.length < 10) {
+      return res.status(400).json({ success: false, error: 'Valid 10-digit phone required' });
+    }
+    const viewer = viewerFrom(req);
+    if (viewer && viewer.role !== 'customer' && viewer.role !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Customers only' });
+    }
+    if (viewer && viewer.role === 'customer' && viewer.phone !== orderPhone) {
+      return res.status(403).json({ success: false, error: 'Phone must be your own number' });
+    }
+    const amountNum = Number(totalAmount || 0);
+    if (!amountNum || amountNum <= 0 || amountNum > 50000) {
+      return res.status(400).json({ success: false, error: 'Valid totalAmount required (₹1–₹50000)' });
+    }
+    let txnid = String(req.body.orderId || req.body.id || '').trim();
+    if (!txnid) {
+      txnid = `FM-${Date.now().toString().slice(-6)}${Math.floor(100 + Math.random() * 900)}`;
+    } else if (!txnid.startsWith('FM-')) {
+      txnid = `FM-${txnid.replace(/^FM/i, '')}`;
+    }
+    const amountPaise = Math.round(amountNum * 100);
+    await saveDraftOrder(txnid, {
+      orderId: txnid,
+      customerName: String(customerName || 'Customer').slice(0, 60),
+      phone: orderPhone,
+      address: address || 'Birmaharajpur',
+      items: items || 'Food items',
+      totalAmount: amountNum,
+      total: `₹${Math.floor(amountNum)}`,
+      createdAt: new Date().toISOString(),
+    });
+    let token;
+    try {
+      token = await phonepeToken();
+    } catch (e) {
+      console.error('PhonePe OAuth failed (sdk-order):', e.message);
+      return res.status(502).json({ success: false, error: 'Payment gateway auth failed — try again' });
+    }
+    let status, json;
+    try {
+      ({ status, json } = await ppPostJson(PHONEPE_SDK_ORDER_URL, {
+        merchantOrderId: txnid,
+        amount: amountPaise,
+        paymentFlow: { type: 'PG_CHECKOUT', message: 'FoodMela Order Payment' },
+      }, token));
+    } catch (e) {
+      console.error('PhonePe SDK order call failed:', e.message);
+      return res.status(502).json({ success: false, error: 'PhonePe could not start payment — try again' });
+    }
+    const sdkToken = json.token || json?.data?.token || json.orderToken;
+    const sdkOrderId = json.orderId || json?.data?.orderId || txnid;
+    if (status !== 200 || !sdkToken) {
+      console.error('PhonePe SDK order rejected:', status, JSON.stringify(json).slice(0, 300));
+      try {
+        await logPayment({ id: txnid, orderId: txnid, customerName, phone: orderPhone, amount: amountNum, gateway: 'PhonePe', payStatus: 'SDK_INIT_FAILED' });
+      } catch (_) { /* ledger best-effort */ }
+      return res.status(502).json({ success: false, error: 'PhonePe could not start payment — try again' });
+    }
+    try {
+      await logPayment({ id: txnid, orderId: txnid, customerName, phone: orderPhone, amount: amountNum, gateway: 'PhonePe', payStatus: 'SDK_INITIATED' });
+    } catch (_) { /* ledger best-effort */ }
+    return res.json({ success: true, orderId: sdkOrderId, merchantOrderId: txnid, token: sdkToken, gateway: 'phonepe-sdk', apiToken: mintApiToken(orderPhone, 'customer') });
+  } catch (err) {
+    console.error('PhonePe SDK order exception:', err.message);
     res.status(500).json({ success: false, error: 'Payment gateway unreachable — try again' });
   }
 });
@@ -1796,7 +2141,7 @@ app.all('/api/phonepe/callback', async (req, res) => {
   }
 });
 
-// 4. STATUS CHECK — LOGIN REQUIRED (same guard as PayU status; no oracle).
+// 4. STATUS CHECK — LOGIN REQUIRED (no oracle).
 app.get('/api/phonepe/status/:txnid', async (req, res) => {
   try {
     if (!viewerFrom(req)) return res.status(401).json({ success: false, error: 'Login required' });
@@ -1831,15 +2176,7 @@ async function getDraftOrder(orderId) {
   return null;
 }
 
-// REMOVED: POST /api/payu/initiate, POST /api/payu/callback,
-// GET /api/payu/status/:txnid (PhonePe-only now). Legacy PayU callbacks
-// get a clean error page instead of a crash.
-app.post('/api/payu/callback', async (req, res) => {
-  return res.redirect(303, 'https://foodmela.online/?payment_error=PayU%20removed%20—%20please%20pay%20via%20PhonePe');
-});
-app.get('/api/payu/status/:txnid', async (req, res) => {
-  return res.status(410).json({ success: false, error: 'PayU removed — PhonePe only' });
-});
+// ─── PHONEPE-ONLY: PayU fully removed. All prepaid goes via PhonePe PG v2. ───
 
 // ✅ ACCEPT ORDER – RIDER ONLY. driverId is taken from the verified token,
 // never from the request body (was fully spoofable). First rider wins;
@@ -1882,7 +2219,7 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
       }
     }
 
-    const orders = await readOrders();
+    let orders = await readOrders();
     let idx = orders.findIndex(o => o.id === rawOrderId || o.orderId === rawOrderId || o.id === orderId || o.orderId === orderId);
     let fsOrder = null;
 
@@ -1910,16 +2247,38 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
       });
     }
 
+    // Re-read latest state: first-rider-wins is decided against CURRENT server
+    // state, and final/cancelled orders can never be (re-)accepted.
+    orders = await readOrders();
+    idx = orders.findIndex(o => o.id === rawOrderId || o.orderId === rawOrderId || o.id === orderId || o.orderId === orderId);
+    const latest = idx !== -1 ? orders[idx] : fsOrder;
+    if (latest.acceptedBy && latest.acceptedBy !== driverId) {
+      return res.status(409).json({
+        success: false,
+        error: `Order already accepted by ${latest.acceptedByName || latest.acceptedBy}`,
+        order: latest,
+      });
+    }
+    if (isFinalStage(latest.stage)) {
+      return res.status(409).json({ success: false, error: 'Order is already final and cannot be accepted', order: latest });
+    }
+    if (Number(latest.stage ?? 0) >= 1) {
+      return res.status(409).json({ success: false, error: 'Order already accepted', order: latest });
+    }
+
     const stamp = new Date().toISOString();
+    const curVersion = Number(latest.statusVersion ?? 0);
     const updatedOrder = {
-      ...cur,
+      ...latest,
       stage: 1,
       status: 'Order Accepted ✅',
+      statusVersion: curVersion + 1,
+      statusHistory: appendStatusHistory(latest, { from: Number(latest.stage ?? 0), to: 1, fromStatus: latest.status || null, toStatus: 'Order Accepted ✅', actor: driverId || null, actorName: driverName || null, opId: req.body.opId ? String(req.body.opId) : null }),
       acceptedBy: driverId || 'driver',
       acceptedByName: driverName || 'Delivery Partner',
       riderName: driverName || 'Delivery Partner',
       riderId: driverId || 'driver',
-      riderPhone: me?.phone || driverId || '',
+      riderPhone: driverId || '',
       acceptedAt: stamp,
       updatedAt: stamp,
     };
@@ -1929,6 +2288,36 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
       await writeOrders(orders);
     }
 
+    // Also update customer history copy in Redis (so GET /api/user/:phone/orders gets rider info)
+    const orderPhone = String(cur.phone || cur.customerPhone || '').replace(/[^0-9]/g, '').slice(-10);
+    if (orderPhone) {
+      try {
+        const user = await readUser(orderPhone);
+        if (Array.isArray(user.orderHistory)) {
+          let touched = false;
+          user.orderHistory = user.orderHistory.map((h) => {
+            if (h.id === orderId || h.orderId === orderId) {
+              touched = true;
+              return {
+                ...h,
+                stage: 1,
+                status: 'Order Accepted ✅',
+                acceptedBy: driverId || 'driver',
+                acceptedByName: driverName || 'Delivery Partner',
+                riderName: driverName || 'Delivery Partner',
+                riderId: driverId || 'driver',
+                riderPhone: driverId || '',
+                acceptedAt: stamp,
+                updatedAt: stamp,
+              };
+            }
+            return h;
+          });
+          if (touched) await writeUser(orderPhone, user);
+        }
+      } catch (e) { console.error('accept user history notice:', e.message); }
+    }
+
     // Mirror to Firestore (Admin SDK bypasses rules)
     try {
       const db = adminDb();
@@ -1936,11 +2325,20 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
         await db.collection('orders').doc(orderId).set({
           stage: 1,
           status: 'Order Accepted ✅',
+          statusVersion: curVersion + 1,
+          statusHistory: updatedOrder.statusHistory,
           riderName: driverName || 'Delivery Partner',
           acceptedByName: driverName || 'Delivery Partner',
-          riderPhone: me?.phone || driverId || '',
-          acceptedByPhone: me?.phone || driverId || '',
+          riderPhone: driverId || '',
+          acceptedByPhone: driverId || '',
           riderId: driverId || 'driver',
+          acceptedBy: driverId || 'driver',
+          // Also stamp the partnerId the rider app uses for call signaling
+          // (listenMyId) — the Firestore fast-path accept writes
+          // riderId=<partnerId>, so both writers must agree.
+          ...(String(req.body.riderPartnerId || req.body.partnerId || '').trim()
+            ? { riderPartnerId: String(req.body.riderPartnerId || req.body.partnerId).trim() }
+            : {}),
           acceptedAt: new Date(),
           updatedAt: new Date(),
         }, { merge: true });
@@ -1962,8 +2360,7 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
 // per-user history, Firestore mirror) are flipped to stage -1 together.
 app.post('/api/orders/cancel', async (req, res) => {
   try {
-    const viewer = viewerFrom(req);
-    if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
+    let viewer = viewerFrom(req);
     const rawOrderId = String(req.body.orderId || '').trim();
     if (!rawOrderId) return res.status(400).json({ success: false, error: 'orderId required' });
     const orderId = rawOrderId.startsWith('FM-') ? rawOrderId : `FM-${rawOrderId.replace(/^FM/i, '')}`;
@@ -1988,6 +2385,14 @@ app.post('/api/orders/cancel', async (req, res) => {
 
     const cur = idx !== -1 ? orders[idx] : fsData;
     const orderPhone = String(cur.phone || cur.customerPhone || '').replace(/[^0-9]/g, '').slice(-10);
+    const reqPhone = String(req.body.phone || '').replace(/[^0-9]/g, '').slice(-10);
+
+    // Unauthenticated website callers (no Authorization header at all or matching phone)
+    // may cancel for the stated order's owner phone — matching place-order & initiate rules.
+    if (!viewer && orderPhone.length >= 10 && (!req.headers.authorization || reqPhone === orderPhone)) {
+      viewer = { phone: orderPhone, role: 'customer' };
+    }
+    if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
     if (viewer.role !== 'admin' && viewer.phone !== orderPhone) {
       return res.status(403).json({ success: false, error: 'Not your order' });
     }
@@ -2019,10 +2424,15 @@ app.post('/api/orders/cancel', async (req, res) => {
 
     // 1) Redis global copy (website orders)
     if (idx !== -1) {
+      if (isFinalStage(orders[idx].stage)) {
+        return res.status(409).json({ success: false, error: 'Order is already final and cannot be cancelled', cancelledOrder: sanitizeOrder(orders[idx], viewer) });
+      }
       orders[idx] = {
         ...orders[idx],
         stage:       -1,
         status:      'CANCELLED BY CUSTOMER 🚨',
+        statusVersion: Number(orders[idx].statusVersion ?? 0) + 1,
+        statusHistory: appendStatusHistory(orders[idx], { from: Number(orders[idx].stage ?? 0), to: -1, fromStatus: orders[idx].status || null, toStatus: 'CANCELLED BY CUSTOMER 🚨', actor: viewer.phone || null, actorName: null, opId: null }),
         cancelledAt: stamp,
         updatedAt:   stamp,
       };
@@ -2056,6 +2466,7 @@ app.post('/api/orders/cancel', async (req, res) => {
         await db.collection('orders').doc(String(orderId)).set({
           stage: -1,
           status: 'Cancelled by Customer',
+          ...(cancelledOrder ? { statusVersion: cancelledOrder.statusVersion, statusHistory: cancelledOrder.statusHistory } : {}),
           cancelledAt: new Date(),
           updatedAt: new Date(),
         }, { merge: true });
@@ -2074,7 +2485,7 @@ app.post('/api/orders/cancel', async (req, res) => {
 app.post('/api/orders/update-stage', requireRider, async (req, res) => {
   try {
     const me = req.apiAuth;
-    const { orderId, newStage } = req.body;
+    const { orderId, newStage, expectedVersion, opId } = req.body;
     if (!orderId || newStage === undefined) {
       return res.status(400).json({ success: false, error: 'orderId and newStage required' });
     }
@@ -2083,8 +2494,16 @@ app.post('/api/orders/update-stage', requireRider, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid stage' });
     }
 
-    const orders = await readOrders();
     const normOrderId = String(orderId).trim().startsWith('FM-') ? String(orderId).trim() : `FM-${String(orderId).trim().replace(/^FM/i, '')}`;
+    // Re-read latest persisted state right before mutating (server is the authority).
+    let orders = await readOrders();
+    // Idempotent retry: same opId already applied → return current server state.
+    if (opId) {
+      const dupIdx = findOrderByOpId(orders, String(opId));
+      if (dupIdx !== -1) {
+        return res.json({ success: true, idempotent: true, order: sanitizeOrder(orders[dupIdx], me) });
+      }
+    }
     let idx = orders.findIndex(o => o.id === orderId || o.orderId === orderId || o.id === normOrderId || o.orderId === normOrderId);
     let fsOrder = null;
     if (idx === -1) {
@@ -2109,8 +2528,21 @@ app.post('/api/orders/update-stage', requireRider, async (req, res) => {
       if (!mine) return res.status(403).json({ success: false, error: 'Only the assigned rider can update this order' });
     }
     const curStage = Number(cur.stage ?? 0);
-    if (stage <= curStage) {
-      return res.status(409).json({ success: false, error: 'Order already past this stage' });
+    const curVersion = Number(cur.statusVersion ?? 0);
+    // Optimistic concurrency: stale client holding an old version loses safely.
+    if (expectedVersion !== undefined && expectedVersion !== null && expectedVersion !== '' && Number(expectedVersion) !== curVersion) {
+      return res.status(409).json({ success: false, stale: true, error: 'Stale state — refresh from server', order: sanitizeOrder(cur, me) });
+    }
+    // Final states are terminal: Delivered/Cancelled can never be rewound.
+    if (isFinalStage(curStage)) {
+      return res.status(409).json({ success: false, error: 'Order is already final and cannot change', order: sanitizeOrder(cur, me) });
+    }
+    // Same-stage label refresh (rider micro-steps like "Reached Store" share one
+    // backend stage): allowed as an idempotent progress note, never a rewind.
+    const reqLabel = typeof req.body.label === 'string' ? req.body.label.slice(0, 80) : '';
+    const isLabelOnly = stage === curStage;
+    if (!isLabelOnly && !transitionAllowed(curStage, stage)) {
+      return res.status(409).json({ success: false, error: 'Order already past this stage', order: sanitizeOrder(cur, me) });
     }
 
     const statusMap = {
@@ -2120,23 +2552,61 @@ app.post('/api/orders/update-stage', requireRider, async (req, res) => {
     };
 
     const stamp = new Date().toISOString();
-    if (idx !== -1) {
-      orders[idx] = {
-        ...orders[idx],
-        stage,
-        status:    statusMap[stage] || 'In Progress',
-        updatedAt: stamp,
-      };
+    const newVersion = curVersion + 1;
+    const effectiveStatus = isLabelOnly && reqLabel ? reqLabel : (statusMap[stage] || 'In Progress');
+    const historyEntry = { from: curStage, to: stage, fromStatus: cur.status || null, toStatus: effectiveStatus, actor: me.phone || null, actorName: me.name || null, opId: opId ? String(opId) : null };
+    const applyPatch = (base) => ({
+      ...base,
+      stage,
+      status: effectiveStatus,
+      ...(isLabelOnly && reqLabel ? { statusLabel: reqLabel } : {}),
+      statusVersion: newVersion,
+      statusHistory: appendStatusHistory(base, historyEntry),
+      updatedAt: stamp,
+      ...(stage === 3 ? { deliveredAt: stamp } : {}),
+    });
+
+    // Re-read once more just before write to shrink the read-modify-write race
+    // window; if another writer moved the order meanwhile, reject as conflict.
+    orders = await readOrders();
+    const reIdx = orders.findIndex(o => o.id === orderId || o.orderId === orderId || o.id === normOrderId || o.orderId === normOrderId);
+    const latest = reIdx !== -1 ? orders[reIdx] : fsOrder;
+    if (latest && (Number(latest.stage ?? 0) !== curStage || Number(latest.statusVersion ?? 0) !== curVersion)) {
+      return res.status(409).json({ success: false, error: 'Concurrent update — refresh from server', order: sanitizeOrder(latest, me) });
+    }
+    let confirmed;
+    if (reIdx !== -1) {
+      orders[reIdx] = applyPatch(orders[reIdx]);
       await writeOrders(orders);
+      confirmed = orders[reIdx];
+    } else {
+      confirmed = applyPatch({ id: normOrderId, orderId: normOrderId, ...(fsOrder || {}) });
+      try {
+        const freshOrders = await readOrders();
+        const existingIdx = freshOrders.findIndex(o => o.id === normOrderId || o.orderId === normOrderId);
+        if (existingIdx !== -1) {
+          // Someone else inserted meanwhile — re-validate against THEIR state.
+          if (!transitionAllowed(Number(freshOrders[existingIdx].stage ?? 0), stage) || isFinalStage(freshOrders[existingIdx].stage)) {
+            return res.status(409).json({ success: false, error: 'Concurrent update — refresh from server', order: sanitizeOrder(freshOrders[existingIdx], me) });
+          }
+          freshOrders[existingIdx] = applyPatch(freshOrders[existingIdx]);
+          confirmed = freshOrders[existingIdx];
+        } else {
+          freshOrders.unshift(confirmed);
+        }
+        await writeOrders(freshOrders);
+      } catch (e) { console.error('update-stage fs->redis sync error:', e.message); }
     }
 
-    // Mirror to Firestore via Admin SDK
+    // Mirror to Firestore via Admin SDK (mirror only — never authoritative).
     try {
       const db = adminDb();
       if (db) {
         const patch = {
           stage,
-          status: statusMap[stage] || 'In Progress',
+          status: effectiveStatus,
+          statusVersion: newVersion,
+          statusHistory: confirmed.statusHistory,
           updatedAt: new Date(),
         };
         if (stage === 3) patch.deliveredAt = new Date();
@@ -2144,23 +2614,8 @@ app.post('/api/orders/update-stage', requireRider, async (req, res) => {
       }
     } catch (e) { console.error('update-stage fs mirror error:', e.message); }
 
-    // When the order was NOT in Redis, upsert it so future customer polls find it
-    if (idx === -1) {
-      try {
-        const freshOrders = await readOrders();
-        const existingIdx = freshOrders.findIndex(o => o.id === normOrderId || o.orderId === normOrderId);
-        if (existingIdx !== -1) {
-          freshOrders[existingIdx] = { ...freshOrders[existingIdx], stage, status: statusMap[stage] || 'In Progress', updatedAt: stamp };
-        } else {
-          const base = fsOrder || {};
-          freshOrders.unshift({ id: normOrderId, orderId: normOrderId, ...base, stage, status: statusMap[stage] || 'In Progress', updatedAt: stamp });
-        }
-        await writeOrders(freshOrders);
-      } catch (e) { console.error('update-stage fs->redis sync error:', e.message); }
-    }
-
-    console.log(`🔄 ORDER ${normOrderId} → Stage ${stage} by ${me.phone}`);
-    res.json({ success: true, order: sanitizeOrder(idx !== -1 ? orders[idx] : { id: normOrderId, ...cur, stage, status: statusMap[stage] }, me) });
+    console.log(`🔄 ORDER ${normOrderId} → Stage ${stage} (v${newVersion}) by ${me.phone}`);
+    res.json({ success: true, order: sanitizeOrder(confirmed, me) });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -2171,9 +2626,11 @@ app.post('/api/orders/update-stage', requireRider, async (req, res) => {
 app.get('/api/orders/past', async (req, res) => {
   try {
     let viewer = viewerFrom(req);
-    const isClient = req.headers['x-app-source'] === 'customer-app' || req.headers['x-app-source'] === 'customer-website';
+    // Read-only history: only fully unauthenticated callers (no Authorization
+    // header) may read the stated phone's history. A forged Bearer token still
+    // fails verifyApiToken, so a header alone never grants access.
     const queryPhone = String(req.query.phone || '').replace(/[^0-9]/g, '').slice(-10);
-    if (!viewer && isClient && queryPhone.length >= 10) {
+    if (!viewer && !req.headers.authorization && queryPhone.length >= 10) {
       viewer = { phone: queryPhone, role: 'customer' };
     }
     if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
