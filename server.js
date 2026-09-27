@@ -204,6 +204,33 @@ app.use('/api/', async (req, res, next) => {
 
 
 const ORDERS_KEY    = 'fm_orders_v1';
+const ORDER_SEQ_KEY = 'fm_order_seq';
+// ─── CENTRAL ORDER NUMBER ─────────────────────────────────────────────────
+// Backend-owned sequence via Redis INCR (atomic, concurrency-safe).
+// Format: FM-YYYYMMDD-NNNNNN (e.g. FM-20260927-000001). The client-supplied
+// id/orderId is kept ONLY as an idempotency key (clientRef) — it is never
+// the official order number.
+async function nextOrderNumber() {
+  const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  let seq = 0;
+  try {
+    const res = await upstashCommand(['INCR', ORDER_SEQ_KEY]);
+    seq = Number(res.result) || 0;
+  } catch (e) {
+    console.error('Order seq INCR error:', e.message);
+  }
+  if (!seq) {
+    // Fallback: derive from existing orders count (not concurrency-safe,
+    // but keeps the format stable if Redis INCR is unavailable).
+    try {
+      const orders = await readOrders();
+      seq = orders.length + 1 + Math.floor(Math.random() * 1000);
+    } catch (_) {
+      seq = Math.floor(Math.random() * 900000) + 100000;
+    }
+  }
+  return `FM-${day}-${String(seq % 1000000).padStart(6, '0')}`;
+}
 
 // ─── API AUTH (phone-based session tokens) ──────────────────────────────────
 // The website proves phone ownership via phone.email OTP; the backend mints a
@@ -814,6 +841,7 @@ function mirrorOrderToFirestore(o) {
       : itemsArr.map((i) => `${i.quantity || 1}x ${i.name || i.itemId || 'Item'}`).join(', ');
     db.collection('orders').doc(String(o.id)).set({
       orderId: String(o.id),
+      order_number: String(o.order_number || o.id),
       customerName: o.customerName || 'Customer',
       customerPhone: cleanPhone || String(o.phone || o.customerPhone || ''),
       address: o.address || '',
@@ -1417,26 +1445,35 @@ const placeOrderHandler = async (req, res) => {
         error: 'Orders above ₹100 must be paid online via PhonePe Gateway.',
       });
     }
-    let rawId = String(req.body.id || req.body.orderId || '').trim();
-    if (!rawId) {
-      rawId = `FM-${Math.floor(1000 + Math.random() * 9000)}`;
-    } else if (!rawId.startsWith('FM-')) {
-      rawId = `FM-${rawId.replace(/^FM/i, '')}`;
-    }
-    const orderId = rawId;
+    // Client-supplied id = idempotency key only (clientRef). The official
+    // order number is ALWAYS backend-generated via nextOrderNumber().
+    const clientRef = String(req.body.id || req.body.orderId || req.body.clientRef || '').trim();
 
     const orders = await readOrders();
 
-    // Deduplicate
-    const existing = orders.find(o => o.id === orderId);
-    if (existing) {
-      return res.json({ success: true, order: existing, duplicate: true });
+    // Idempotency: retry with the same clientRef returns the original order.
+    if (clientRef) {
+      const prior = orders.find(o => o.clientRef === clientRef || o.id === clientRef || o.orderId === clientRef);
+      if (prior) {
+        return res.json({ success: true, order: prior, duplicate: true });
+      }
+    }
+
+    let finalOrderId = await nextOrderNumber();
+    // Paranoia: sequence collision (shouldn't happen with INCR) → retry once.
+    if (orders.some(o => o.id === finalOrderId || o.orderId === finalOrderId)) {
+      const retryId = await nextOrderNumber();
+      if (!orders.some(o => o.id === retryId || o.orderId === retryId)) {
+        finalOrderId = retryId;
+      }
     }
 
     const totalStr = req.body.total || `₹${Math.floor(totalAmount || 0)}`;
 
     const newOrder = {
-      id:           orderId,
+      id:           finalOrderId,
+      order_number: finalOrderId,
+      clientRef:    clientRef || null,
       customerName: customerName || 'Customer',
       phone:        orderPhone   || phone || 'unknown',
       customerPhone: orderPhone  || phone || 'unknown',
@@ -1448,7 +1485,7 @@ const placeOrderHandler = async (req, res) => {
       status:       'Order Placed & Waiting for Delivery Boy 📝🍳',
       acceptedBy:   null,
       acceptedByName: null,
-      deliveryOtp:  req.body.deliveryOtp || String(1000 + Math.floor(Math.random() * 9000)),
+      deliveryOtp:  String(crypto.randomInt(1000, 10000)),
       timestamp:    new Date().toISOString(),
       placedAt:     new Date().toISOString(),
       updatedAt:    new Date().toISOString(),
@@ -1461,13 +1498,13 @@ const placeOrderHandler = async (req, res) => {
     if (orderPhone) {
       const user = await readUser(orderPhone);
       if (!user.orderHistory) user.orderHistory = [];
-      user.orderHistory = user.orderHistory.filter(o => (o.id || o.orderId) !== orderId);
+      user.orderHistory = user.orderHistory.filter(o => (o.id || o.orderId) !== finalOrderId);
       user.orderHistory.unshift({ ...newOrder, orderStatus: 'placed' });
       if (user.orderHistory.length > 50) user.orderHistory = user.orderHistory.slice(0, 50);
       await writeUser(orderPhone, user);
     }
 
-    console.log(`🔔 NEW ORDER: ${orderId} by ${customerName}`);
+    console.log(`🔔 NEW ORDER: ${finalOrderId} by ${customerName} (ref ${clientRef || "-"})`);
     pushNewOrderToRiders(newOrder); // background/killed-app ring via FCM
     mirrorOrderToFirestore(newOrder); // app + website live sync
     res.status(201).json({ success: true, order: newOrder, apiToken: mintApiToken(orderPhone, 'customer') });
@@ -1631,7 +1668,7 @@ async function createPaidOrder({ txnid, customerName, phone, address, items, tot
     paymentGateway: gateway,
     acceptedBy: null,
     acceptedByName: null,
-    deliveryOtp: String(1000 + Math.floor(Math.random() * 9000)),
+    deliveryOtp: String(crypto.randomInt(1000, 10000)),
     timestamp: new Date().toISOString(),
     placedAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -2484,11 +2521,15 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
       } catch (e) { console.error('accept user history notice:', e.message); }
     }
 
-    // Mirror to Firestore (Admin SDK bypasses rules)
+    // Mirror to Firestore (Admin SDK bypasses rules).
+    // Write BOTH doc paths: Firestore orders are stored under an auto-generated
+    // ID which the customer watches, while the rider knows the `FM-xxx` string.
+    // Writing only one path is why the customer never saw "Accepted" — the
+    // accept updated a different doc than the customer's live listener watched.
     try {
       const db = adminDb();
       if (db) {
-        await db.collection('orders').doc(orderId).set({
+        const fsPatch = {
           stage: 1,
           status: 'Order Accepted ✅',
           statusVersion: curVersion + 1,
@@ -2507,7 +2548,38 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
             : {}),
           acceptedAt: new Date(),
           updatedAt: new Date(),
-        }, { merge: true });
+        };
+        // Primary path the customer Firestore listener watches (raw doc id).
+        let primaryId = orderId;
+        // If the order was placed with an auto-generated Firestore ID, the rider
+        // only knows it by the `FM-xxx` alias. Look up the real doc id so we
+        // write to the doc the customer is watching.
+        try {
+          const qSnap = await db.collection('orders')
+            .where('orderId', '==', orderId)
+            .limit(1).get();
+          if (!qSnap.empty) {
+            primaryId = qSnap.docs.first.id;
+          } else {
+            // fall back to a direct get on both forms
+            const direct = await db.collection('orders').doc(orderId).get();
+            if (!direct.exists) {
+              const raw = String(rawOrderId).trim();
+              if (raw && raw !== orderId) {
+                const directRaw = await db.collection('orders').doc(raw).get();
+                if (directRaw.exists) primaryId = directRaw.id;
+              }
+            } else {
+              primaryId = direct.id;
+            }
+          }
+        } catch (e) { console.error('accept fs doc-id lookup error:', e.message); }
+
+        await db.collection('orders').doc(primaryId).set(fsPatch, { merge: true });
+        // Also write the FM-xxx alias doc so any listener keyed on that form sees it.
+        if (primaryId !== orderId) {
+          await db.collection('orders').doc(orderId).set(fsPatch, { merge: true });
+        }
       }
     } catch (e) { console.error('accept fs mirror error:', e.message); }
 
@@ -2689,14 +2761,19 @@ app.post('/api/orders/update-stage', requireRider, async (req, res) => {
 
     const cur = idx !== -1 ? orders[idx] : fsOrder;
     if (me.role !== 'admin') {
+      const norm = (p) => String(p || '').replace(/[^0-9]/g, '').slice(-10);
       const by = String(cur.acceptedBy || cur.riderId || cur.riderPhone || '');
-      const mine = by && (by === me.phone || by.replace(/[^0-9]/g, '').slice(-10) === me.phone);
+      const mine = by && (by === me.phone || norm(by) === norm(me.phone));
       if (!mine) return res.status(403).json({ success: false, error: 'Only the assigned rider can update this order' });
     }
     const curStage = Number(cur.stage ?? 0);
     const curVersion = Number(cur.statusVersion ?? 0);
     // Optimistic concurrency: stale client holding an old version loses safely.
-    if (expectedVersion !== undefined && expectedVersion !== null && expectedVersion !== '' && Number(expectedVersion) !== curVersion) {
+    // Same-stage label notes (Reached Store / Picked Up) are idempotent progress
+    // notes — never reject them on version skew (Firestore mirror lags Redis).
+    const reqLabelEarly = typeof req.body.label === 'string' ? req.body.label.slice(0, 80) : '';
+    const isLabelOnlyEarly = stage === curStage;
+    if (!isLabelOnlyEarly && expectedVersion !== undefined && expectedVersion !== null && expectedVersion !== '' && Number(expectedVersion) !== curVersion) {
       return res.status(409).json({ success: false, stale: true, error: 'Stale state — refresh from server', order: sanitizeOrder(cur, me) });
     }
     // Final states are terminal: Delivered/Cancelled can never be rewound.
@@ -2777,6 +2854,12 @@ app.post('/api/orders/update-stage', requireRider, async (req, res) => {
         };
         if (stage === 3) patch.deliveredAt = new Date();
         await db.collection('orders').doc(normOrderId).set(patch, { merge: true });
+        try {
+          const rawId = String(orderId).trim();
+          if (rawId && rawId !== normOrderId) {
+            await db.collection('orders').doc(rawId).set(patch, { merge: true });
+          }
+        } catch (_) {}
       }
     } catch (e) { console.error('update-stage fs mirror error:', e.message); }
 
