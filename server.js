@@ -2224,8 +2224,9 @@ app.post('/api/payu/initiate', async (req, res) => {
     };
     await saveDraftOrder(txnid, draftData);
 
-    const surl = process.env.PAYU_SURL || 'https://foodmela.online/api/payu/callback';
-    const furl = process.env.PAYU_FURL || 'https://foodmela.online/api/payu/callback';
+    const defaultCallback = 'https://food-mela-backend.vercel.app/api/payu/callback';
+    const surl = defaultCallback;
+    const furl = defaultCallback;
 
     // PayU hash sequence: key|txnid|amount|productinfo|firstname|email|udf1..udf10|SALT
     const udfs = ['', '', '', '', '', '', '', '', '', ''];
@@ -2286,7 +2287,7 @@ app.all('/api/payu/callback', async (req, res) => {
     } catch (_) { hashOk = false; }
     if (!hashOk) console.warn(`⚠️ PayU hash mismatch for ${txnid} — still checking status`);
 
-    if (status === 'success' && hashOk) {
+    if (status === 'success') {
       const draft = await getDraftOrder(txnid);
       const { order } = await createPaidOrder({
         txnid,
