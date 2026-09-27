@@ -88,6 +88,7 @@ app.use('/api/auth/', limitAuth);
 app.use('/api/admin/', limitAuth);
 app.use('/api/auth/phone-email/verify', limitOtpVerify);
 app.use('/api/phonepe/initiate', rateLimit({ windowMs: 60 * 1000, max: 30, prefix: 'phonepe' }));
+app.use('/api/payu/initiate', rateLimit({ windowMs: 60 * 1000, max: 30, prefix: 'payu' }));
 // Per-phone OTP cooldown: phone → last successful verify timestamp (2 min).
 // In-memory + serverless-safe (each instance throttles independently — a bot
 // hitting many instances still faces the per-IP bucket on every instance).
@@ -2183,7 +2184,164 @@ async function getDraftOrder(orderId) {
   return null;
 }
 
-// ─── PHONEPE-ONLY: PayU fully removed. All prepaid goes via PhonePe PG v2. ───
+// ─── PAYU PAYMENT GATEWAY INTEGRATION ────────────────────────────────────────
+const PAYU_KEY = process.env.PAYU_KEY || 'YT9Kis';
+const PAYU_SALT = process.env.PAYU_SALT || 'jMBPPnuLnXRlhthvj8V8Onq9tiYRS6hA';
+const PAYU_ENV = process.env.PAYU_ENV || 'production';
+const PAYU_BASE = PAYU_ENV === 'production' ? 'https://secure.payu.in' : 'https://test.payu.in';
+const PAYU_PAYMENT_URL = `${PAYU_BASE}/_payment`;
+const PAYU_VERIFY_URL = PAYU_ENV === 'production'
+  ? 'https://info.payu.in/merchant/postservice?form=2'
+  : 'https://test.payu.in/merchant/postservice?form=2';
+
+// 1. INITIATE PAYMENT – Builds PayU hash + form fields for frontend auto-submit
+app.post('/api/payu/initiate', async (req, res) => {
+  try {
+    if (!PAYU_KEY || !PAYU_SALT) {
+      return res.status(500).json({ success: false, error: 'PayU not configured' });
+    }
+    const { customerName, phone, email, address, items, totalAmount } = req.body || {};
+    const amountNum = Number(totalAmount || 0);
+    if (!amountNum || amountNum <= 0) {
+      return res.status(400).json({ success: false, error: 'Valid totalAmount required' });
+    }
+
+    const txnid = req.body.orderId || `FM${Date.now().toString().slice(-8)}`;
+    const amtStr = amountNum.toFixed(2);
+    const firstname = (customerName || 'Customer').slice(0, 60);
+    const cleanPhone = String(phone || '').replace(/[^0-9]/g, '').slice(-10);
+    const productinfo = 'FoodMela Order';
+
+    const draftData = {
+      orderId: txnid,
+      customerName: firstname,
+      phone: phone || 'unknown',
+      address: address || 'Birmaharajpur',
+      items: items || 'Food items',
+      totalAmount: amountNum,
+      total: `₹${Math.floor(amountNum)}`,
+      createdAt: new Date().toISOString(),
+    };
+    await saveDraftOrder(txnid, draftData);
+
+    const surl = process.env.PAYU_SURL || 'https://foodmela.online/api/payu/callback';
+    const furl = process.env.PAYU_FURL || 'https://foodmela.online/api/payu/callback';
+
+    // PayU hash sequence: key|txnid|amount|productinfo|firstname|email|udf1..udf10|SALT
+    const udfs = ['', '', '', '', '', '', '', '', '', ''];
+    const hashSeq = [PAYU_KEY, txnid, amtStr, productinfo, firstname, email || '', ...udfs, PAYU_SALT].join('|');
+    const hash = crypto.createHash('sha512').update(hashSeq).digest('hex');
+
+    return res.json({
+      success: true,
+      payuUrl: PAYU_PAYMENT_URL,
+      fields: {
+        key: PAYU_KEY,
+        txnid,
+        amount: amtStr,
+        productinfo,
+        firstname,
+        email: email || '',
+        phone: cleanPhone,
+        surl,
+        furl,
+        hash,
+        udf1: '', udf2: '', udf3: '', udf4: '', udf5: '',
+        udf6: '', udf7: '', udf8: '', udf9: '', udf10: '',
+      },
+      apiToken: mintApiToken(cleanPhone, 'customer'),
+    });
+  } catch (err) {
+    console.error('PayU initiate exception:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 2. SURL/FURL CALLBACK – Verify PayU reverse hash & place order on success
+app.all('/api/payu/callback', async (req, res) => {
+  if (req.method === 'GET' || req.method === 'HEAD') {
+    return res.status(200).json({ success: true, message: 'PayU callback endpoint active' });
+  }
+  try {
+    const d = req.body || {};
+    const txnid = d.txnid || '';
+    const status = (d.status || '').toLowerCase();
+    const payuMoneyId = d.payuMoneyId || d.mihpayid || '';
+
+    console.log(`🔔 PayU Callback: ${txnid} -> status: ${d.status}, mode: ${d.mode}`);
+
+    if (!txnid) {
+      return res.redirect(303, 'https://foodmela.online/?payment_error=Missing%20Order%20ID');
+    }
+
+    // Verify reverse hash: SALT|status|udf10..udf1|email|firstname|productinfo|amount|txnid|key
+    let hashOk = false;
+    try {
+      const udfs = [d.udf10 || '', d.udf9 || '', d.udf8 || '', d.udf7 || '', d.udf6 || '',
+                    d.udf5 || '', d.udf4 || '', d.udf3 || '', d.udf2 || '', d.udf1 || ''];
+      const revSeq = [PAYU_SALT, status, ...udfs, d.email || '', d.firstname || '',
+                      d.productinfo || '', d.amount || '', txnid, PAYU_KEY].join('|');
+      const expected = crypto.createHash('sha512').update(revSeq).digest('hex');
+      hashOk = expected === (d.hash || '');
+    } catch (_) { hashOk = false; }
+    if (!hashOk) console.warn(`⚠️ PayU hash mismatch for ${txnid} — still checking status`);
+
+    if (status === 'success' && hashOk) {
+      const draft = await getDraftOrder(txnid);
+      const { order } = await createPaidOrder({
+        txnid,
+        customerName: draft?.customerName || d.firstname || 'Customer',
+        phone: draft?.phone || d.phone || 'unknown',
+        address: draft?.address || 'Birmaharajpur',
+        items: draft?.items || 'Food items',
+        totalAmount: draft?.totalAmount || Number(d.amount || 0),
+        gatewayRef: payuMoneyId || txnid,
+        gateway: 'PayU',
+      });
+
+      console.log(`✅ PAID ORDER via PayU: ${txnid} by ${order.customerName} (₹${d.amount})`);
+      return res.redirect(303, `https://foodmela.online/track/${encodeURIComponent(txnid)}?paid=1`);
+    } else {
+      console.warn(`❌ PayU Payment Not Successful: ${txnid} (${d.error_Message || d.error || 'failed'})`);
+      return res.redirect(303, `https://foodmela.online/?payment_error=${encodeURIComponent(d.error_Message || 'Payment Failed')}&orderId=${encodeURIComponent(txnid)}`);
+    }
+  } catch (err) {
+    console.error('PayU callback exception:', err);
+    return res.redirect(303, 'https://foodmela.online/?payment_error=Callback%20processing%20error');
+  }
+});
+
+// 3. TRANSACTION STATUS CHECK via PayU verify API
+app.get('/api/payu/status/:txnid', async (req, res) => {
+  try {
+    const txnid = req.params.txnid;
+    const hashSeq = [PAYU_KEY, 'verify_payment', txnid, PAYU_SALT].join('|');
+    const hash = crypto.createHash('sha512').update(hashSeq).digest('hex');
+    const body = new URLSearchParams({ key: PAYU_KEY, hash, var1: txnid, command: 'verify_payment' }).toString();
+    const u = new URL(PAYU_VERIFY_URL);
+    const verifyReq = https.request(u, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    }, (resp) => {
+      let data = '';
+      resp.on('data', chunk => data += chunk);
+      resp.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          const txnData = parsed?.transaction_details?.[txnid];
+          res.json({ success: true, status: txnData?.status || 'unknown', details: txnData });
+        } catch (_) {
+          res.json({ success: true, raw: data });
+        }
+      });
+    });
+    verifyReq.on('error', (err) => res.status(500).json({ success: false, error: err.message }));
+    verifyReq.write(body);
+    verifyReq.end();
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
 
 // ✅ ACCEPT ORDER – RIDER ONLY. driverId is taken from the verified token,
 // never from the request body (was fully spoofable). First rider wins;
