@@ -116,10 +116,72 @@ function agoraRest(path, method, payload) {
 
 const FIRESTORE_PROJECT = process.env.FIRESTORE_PROJECT_ID || 'food-mela-notification';
 
-// Orders are created straight into Firestore by the apps (public read rule),
-// so Redis may not have them. Fall back to the Firestore REST API (no auth
-// needed — orders are publicly readable per firestore.rules).
-function fetchOrderFromFirestore(orderId) {
+// Orders are created straight into Firestore by the apps, so Redis may not
+// have them. Fall back to a server-side Firestore read via the Firebase
+// Admin SDK (same service account as server.js adminDb — bypasses client
+// security rules server-side, exactly like the accept mirror does).
+// Client firestore.rules stay hardened; nothing is publicly readable.
+let _callAdminDb = null;
+function callAdminDb() {
+  try {
+    const raw = process.env.FCM_SERVICE_ACCOUNT || '';
+    if (!raw) return null;
+    const sa = JSON.parse(raw);
+    if (!sa || !sa.private_key || !sa.client_email) return null;
+    const admin = require('firebase-admin');
+    if (!_callAdminDb) {
+      const app = admin.apps.length
+        ? admin.app()
+        : admin.initializeApp({ credential: admin.credential.cert(sa), projectId: sa.project_id || FIRESTORE_PROJECT });
+      _callAdminDb = app.firestore();
+    }
+    return _callAdminDb;
+  } catch (e) {
+    console.error('call adminDb init notice:', e.message);
+    return null;
+  }
+}
+
+function normalizeOrderDoc(orderId, d) {
+  if (!d) return null;
+  const str = (k) => {
+    const v = d[k];
+    return typeof v === 'string' ? v : '';
+  };
+  const num = (k) => {
+    const v = d[k];
+    return typeof v === 'number' ? v : 0;
+  };
+  return {
+    id: str('orderId') || orderId,
+    phone: str('customerPhone'),
+    // The rider app accepts via the Firestore fast-path with
+    // riderId=<partnerId> (e.g. FM-R-001); the backend accept stamps
+    // riderId=<token phone>. Read every id shape so membership checks
+    // work no matter which writer claimed the order.
+    acceptedBy: str('riderId') || str('acceptedBy') || str('riderPartnerId') || null,
+    riderPartnerId: str('riderPartnerId') || null,
+    riderPhone: str('riderPhone') || str('acceptedByPhone') || null,
+    acceptedByName: str('riderName') || null,
+    stage: num('stage'),
+    status: str('status'),
+  };
+}
+
+async function fetchOrderFromFirestore(orderId) {
+  // Primary: Admin SDK (authenticated, rule-bypassing, server-side only).
+  try {
+    const db = callAdminDb();
+    if (db) {
+      const snap = await db.collection('orders').doc(String(orderId)).get();
+      if (snap.exists) return normalizeOrderDoc(orderId, snap.data());
+      return null;
+    }
+  } catch (e) {
+    console.error('call order admin read notice:', e.message);
+  }
+  // Fallback: unauthenticated REST (works only if rules ever allow it;
+  // kept for local dev without a service account — never weakens rules).
   return new Promise((resolve) => {
     const path = `/v1/projects/${FIRESTORE_PROJECT}/databases/(default)/documents/orders/${encodeURIComponent(orderId)}`;
     const req = https.request({ hostname: 'firestore.googleapis.com', path, method: 'GET' }, (res) => {
@@ -132,14 +194,13 @@ function fetchOrderFromFirestore(orderId) {
           const str = (k) => (f[k] && (f[k].stringValue ?? null) !== null ? String(f[k].stringValue) : '');
           const num = (k) => (f[k] && f[k].integerValue !== undefined ? Number(f[k].integerValue) : 0);
           if (!doc.fields) return resolve(null);
-          resolve({
-            id: str('orderId') || orderId,
-            phone: str('customerPhone'),
-            acceptedBy: str('riderId') || null,
-            acceptedByName: str('riderName') || null,
-            stage: num('stage'),
-            status: str('status'),
-          });
+          resolve(normalizeOrderDoc(orderId, {
+            orderId: str('orderId'), customerPhone: str('customerPhone'),
+            riderId: str('riderId'), acceptedBy: str('acceptedBy'),
+            riderPartnerId: str('riderPartnerId'), riderPhone: str('riderPhone'),
+            acceptedByPhone: str('acceptedByPhone'), riderName: str('riderName'),
+            stage: num('stage'), status: str('status'),
+          }));
         } catch { resolve(null); }
       });
     });
@@ -150,12 +211,27 @@ function fetchOrderFromFirestore(orderId) {
 }
 
 async function findOrder(orderId, readOrders) {
+  // Match EVERY id shape the apps use: backend official id/order_number,
+  // clientRef (TMP-/FM-timestamp local id), and FM- prefix variants.
+  // The customer app calls with its LOCAL id before reconcile lands in
+  // Redis — exact-match on `id` alone 404s ("Order not found" → Call failed).
+  const wanted = String(orderId || '').trim();
+  const norm = wanted.startsWith('FM-') ? wanted : `FM-${wanted.replace(/^FM/i, '')}`;
+  const bare = wanted.replace(/^FM-?/i, '');
   try {
     const orders = await readOrders();
-    const hit = orders.find((o) => o.id === orderId);
+    const hit = orders.find((o) => {
+      const ids = [o.id, o.orderId, o.order_number, o.clientRef]
+        .map((v) => String(v || '').trim())
+        .filter(Boolean);
+      return ids.includes(wanted) || ids.includes(norm) || ids.some((id) => id.replace(/^FM-?/i, '') === bare);
+    });
     if (hit) return hit;
   } catch (_) {}
-  return fetchOrderFromFirestore(orderId);
+  const fsHit = await fetchOrderFromFirestore(wanted);
+  if (fsHit) return fsHit;
+  if (norm !== wanted) return fetchOrderFromFirestore(norm);
+  return null;
 }
 
 const normPhone = (p) => String(p || '').replace(/[^0-9]/g, '').slice(-10);
@@ -192,8 +268,11 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       const claimed = String(userId);
       const claimedNorm = normPhone(claimed);
       const viewerNorm = normPhone(viewer.phone);
+      // Rider apps send partnerId (e.g. "FM-R-001") as userId — it won't
+      // normalize to a phone. Allow it when the viewer has a valid rider token;
+      // membership is validated below against the order's acceptedBy field.
       const samePerson = claimed === viewer.phone || (claimedNorm.length >= 10 && claimedNorm === viewerNorm);
-      if (!samePerson && viewer.role !== 'admin') {
+      if (!samePerson && viewer.role !== 'admin' && viewer.role !== 'rider') {
         return res.status(403).json({ success: false, error: 'userId must be your own number' });
       }
 
@@ -201,10 +280,20 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
       if (!orderIsActive(order)) return res.status(403).json({ success: false, error: 'Order is not active — calling disabled' });
 
-      // Membership: customer phone match OR assigned rider match
+      // Membership: customer phone match OR assigned rider match.
+      // Rider id shapes: partnerId (FM-R-001), token phone, riderPhone,
+      // acceptedByPhone — the two accept writers stamp different shapes,
+      // so match every known rider id on the order.
       const me = String(userId);
       const isCustomer = normPhone(me) === normPhone(order.phone) && normPhone(me).length >= 10;
-      const isRider = order.acceptedBy && (me === order.acceptedBy || normPhone(me) === normPhone(order.acceptedBy));
+      const riderIds = [order.acceptedBy, order.riderPartnerId, order.riderPhone]
+        .map((v) => String(v || ''));
+      const isRider = riderIds.some((id) => id !== '' && (
+        me === id
+        || (normPhone(me).length >= 10 && normPhone(me) === normPhone(id))
+      )) || (viewer.role === 'rider' && riderIds.some((id) =>
+        id !== '' && normPhone(viewer.phone) === normPhone(id)
+          && normPhone(viewer.phone).length >= 10));
       // Before accept (stage 0, no rider yet): only customer may fetch a token
       if (!isCustomer && !isRider) return res.status(403).json({ success: false, error: 'Not part of this order' });
 
@@ -229,7 +318,10 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
       const claimedNorm = normPhone(String(callerId));
       const viewerNorm = normPhone(viewer.phone);
-      if (claimedNorm !== viewerNorm && viewer.role !== 'admin') {
+      // Rider apps send partnerId (e.g. "FM-R-001") as callerId. When the
+      // caller has a valid rider token, trust the token and skip the phone-match
+      // check — membership is validated below against the order.
+      if (claimedNorm !== viewerNorm && viewer.role !== 'admin' && viewer.role !== 'rider') {
         return res.status(403).json({ success: false, error: 'callerId must be your own number' });
       }
       const order = await findOrder(orderId, readOrders);
@@ -238,15 +330,39 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
 
       const me = String(callerId);
       const isCustomer = normPhone(me) === normPhone(order.phone) && normPhone(me).length >= 10;
-      const isRider = order.acceptedBy && (me === order.acceptedBy || normPhone(me) === normPhone(order.acceptedBy));
+      // Rider sends partnerId but the order may carry phone or partnerId
+      // shapes (two accept writers) — match every known rider id.
+      const riderIds = [order.acceptedBy, order.riderPartnerId, order.riderPhone]
+        .map((v) => String(v || ''));
+      const isRider = riderIds.some((id) => id !== '' && (
+        me === id
+        || (normPhone(me).length >= 10 && normPhone(me) === normPhone(id))
+      )) || (viewer.role === 'rider' && riderIds.some((id) =>
+        id !== '' && normPhone(viewer.phone) === normPhone(id)
+          && normPhone(viewer.phone).length >= 10));
       if (!isCustomer && !isRider) return res.status(403).json({ success: false, error: 'Not part of this order' });
 
       const role = callerRole || (isRider ? 'rider' : 'customer');
       const otherRole = role === 'customer' ? 'rider' : 'customer';
-      const otherId = receiverId || (role === 'customer' ? (order.acceptedBy || '') : (order.phone || ''));
+      // receiverId must be an id the recipient actually listens with. The rider
+      // app listens with its partnerId (listenMyId), but order.acceptedBy may
+      // be the token phone after the backend accept mirror — prefer the
+      // partnerId shape when known so the Firestore invite reaches the rider.
+      const riderListenId = order.riderPartnerId || order.acceptedBy || '';
+      const otherId = receiverId || (role === 'customer' ? riderListenId : (order.phone || ''));
       if (!otherId) return res.status(409).json({ success: false, error: 'No rider assigned yet — cannot call' });
 
       const logs = await readCallLogs();
+      // Dedup: same caller re-ringing the same order within 60s reuses the live
+      // call instead of spawning a duplicate ring on the recipient's phone.
+      const nowMs = Date.now();
+      const live = logs.find((l) => String(l.orderId) === String(orderId)
+        && l.status === 'ringing'
+        && String(l.callerId) === String(me)
+        && (nowMs - new Date(l.createdAt).getTime()) < 60000);
+      if (live) {
+        return res.status(200).json({ success: true, duplicate: true, callId: live.id, channelName: live.channelName, log: live });
+      }
       const log = {
         id: `call_${Date.now()}_${Math.floor(Math.random() * 1e4)}`,
         orderId, channelName: channelFor(orderId),
@@ -276,6 +392,15 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       const logs = await readCallLogs();
       const log = logs.find((l) => l.id === callId);
       if (!log) return res.status(404).json({ success: false, error: 'Call not found' });
+      const vNorm2 = normPhone(viewer.phone);
+      const isRecMember = viewer.role === 'admin'
+        || normPhone(log.callerId) === vNorm2
+        || normPhone(log.receiverId) === vNorm2
+        || (viewer.role === 'rider' && (log.callerRole === 'rider' || log.receiverRole === 'rider'));
+      if (!isRecMember) return res.status(403).json({ success: false, error: 'Not part of this call' });
+      if (String(log.orderId) !== String(req.params.orderId)) {
+        return res.status(403).json({ success: false, error: 'Call does not belong to this order' });
+      }
 
       const channel = log.channelName;
       const recToken = RtcTokenBuilder
@@ -353,13 +478,56 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
     }
   });
 
-  // ── POST /api/calls/:orderId/status { callId, status, duration? } (reject/miss/cancel) ──
+  // ── POST /api/calls/:orderId/status { callId, status, duration? } ──
+  // Full lifecycle: accepted | rejected | missed | ended | failed | cancelled.
+  // Terminal states are final — a stale client can never rewind an ended call
+  // back to ringing/accepted. Only order members may transition a call.
+  const TERMINAL_CALL_STATES = ['rejected', 'missed', 'ended', 'failed', 'cancelled'];
   app.post('/api/calls/:orderId/status', async (req, res) => {
     try {
       const { callId, status, duration = 0 } = req.body || {};
-      if (!['rejected', 'missed', 'ended', 'failed'].includes(status)) {
+      if (!['accepted', 'rejected', 'missed', 'ended', 'failed', 'cancelled'].includes(status)) {
         return res.status(400).json({ success: false, error: 'bad status' });
       }
+      const viewer = viewerOf(req);
+      if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
+      const logs = await readCallLogs();
+      const log = logs.find((l) => l.id === callId);
+      if (!log) return res.status(404).json({ success: false, error: 'Call not found' });
+      if (String(log.orderId) !== String(req.params.orderId)) {
+        return res.status(403).json({ success: false, error: 'Call does not belong to this order' });
+      }
+      const vNorm = normPhone(viewer.phone);
+      // callerId/receiverId may be a partnerId (e.g. "FM-R-001") which
+      // normalizes to "" — fall back to rider role when phone doesn't match.
+      const isMember = viewer.role === 'admin'
+        || normPhone(log.callerId) === vNorm
+        || normPhone(log.receiverId) === vNorm
+        || (viewer.role === 'rider' && (log.callerRole === 'rider' || log.receiverRole === 'rider'));
+      if (!isMember) return res.status(403).json({ success: false, error: 'Not part of this call' });
+      if (TERMINAL_CALL_STATES.includes(log.status)) {
+        return res.status(409).json({ success: false, error: 'Call already ended', log });
+      }
+      if (status === 'accepted' && log.status !== 'ringing') {
+        return res.status(409).json({ success: false, error: 'Call is no longer ringing', log });
+      }
+      log.status = status;
+      if (status === 'accepted') log.startedAt = log.startedAt || new Date().toISOString();
+      if (duration) log.duration = Number(duration);
+      if (TERMINAL_CALL_STATES.includes(status)) log.endedAt = new Date().toISOString();
+      await writeCallLogs(logs);
+      res.json({ success: true, log });
+    } catch (e) {
+      res.status(500).json({ success: false, error: e.message });
+    }
+  });
+
+  // ── POST /api/calls/:orderId/timeout { callId } ──
+  // Server-side missed-call sweeper: any caller (or cron) can mark a ringing
+  // call older than 45s as missed, so stale rings never haunt the recipient.
+  app.post('/api/calls/:orderId/timeout', async (req, res) => {
+    try {
+      const { callId } = req.body || {};
       if (!viewerOf(req)) return res.status(401).json({ success: false, error: 'Login required' });
       const logs = await readCallLogs();
       const log = logs.find((l) => l.id === callId);
@@ -367,8 +535,10 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       if (String(log.orderId) !== String(req.params.orderId)) {
         return res.status(403).json({ success: false, error: 'Call does not belong to this order' });
       }
-      log.status = status;
-      if (duration) log.duration = Number(duration);
+      if (log.status !== 'ringing') return res.json({ success: true, already: true, log });
+      const ageMs = Date.now() - new Date(log.createdAt).getTime();
+      if (ageMs < 45000) return res.json({ success: true, tooEarly: true, log });
+      log.status = 'missed';
       log.endedAt = new Date().toISOString();
       await writeCallLogs(logs);
       res.json({ success: true, log });
@@ -467,6 +637,10 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
   // No API shape change — additive. Query: ?object=call_recordings/FM-1/….mp3
   app.get('/api/admin/call-recordings/play', async (req, res) => {
     try {
+      const viewer = viewerOf(req);
+      if (!viewer || viewer.role !== 'admin') {
+        return res.status(403).json({ success: false, error: 'Admin only' });
+      }
       const objectName = String(req.query.object || '');
       if (!objectName || objectName.includes('..') || objectName.startsWith('/')) {
         return res.status(400).json({ success: false, error: 'bad object name' });
