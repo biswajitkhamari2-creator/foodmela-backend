@@ -2573,14 +2573,44 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
               primaryId = direct.id;
             }
           }
-        } catch (e) { console.error('accept fs doc-id lookup error:', e.message); }
+      } catch (docLookupErr) { console.error('accept fs doc-id lookup error:', docLookupErr.message); }
 
-        await db.collection('orders').doc(primaryId).set(fsPatch, { merge: true });
-        // Also write the FM-xxx alias doc so any listener keyed on that form sees it.
-        if (primaryId !== orderId) {
-          await db.collection('orders').doc(orderId).set(fsPatch, { merge: true });
+      // ATOMIC WRITE: re-check stage == 0 inside a Firestore transaction so
+      // two riders can't both accept. If another rider got in first, this
+      // throws "already-accepted" and we log/409 the late rider — no double accept.
+      const writeDoc = async (tx, docId, patch) => {
+        const ref = db.collection('orders').doc(docId);
+        const snap = await tx.get(ref);
+        if (snap.exists) {
+          const existed = snap.data();
+          if ((Number(existed?.stage ?? 0)) !== 0) throw new Error('already-accepted');
+          tx.set(ref, patch, { merge: true });
+        } else {
+          tx.set(ref, patch);
         }
+      };
+      try {
+        await db.runTransaction(async (tx) => {
+          if (primaryId) writeDoc(tx, primaryId, fsPatch);
+          if (primaryId !== orderId) writeDoc(tx, orderId, fsPatch);
+        });
+      } catch (txErr) {
+        const msg = String(txErr?.message || '').toLowerCase();
+        if (msg.includes('already-accepted')) {
+          console.log(`🚫 ORDER ${orderId} — late accept rejected (already accepted by another rider)`);
+          return res.status(409).json({
+            success: false,
+            error: 'Order already accepted by another rider',
+            order: sanitizeOrder(updatedOrder, me),
+          });
+        } else {
+          console.error('accept fs transaction error:', txErr?.message);
+        }
+        // Transaction failure does NOT fail the whole accept — Redis is the
+        // authority and already committed. Customer may see a slight mirror
+        // lag, but no double-accept happens. Just skip the Firestore write.
       }
+    }
     } catch (e) { console.error('accept fs mirror error:', e.message); }
 
     console.log(`✅ ORDER ${orderId} ACCEPTED by ${driverName}`);
