@@ -9,3 +9,6 @@ dist/
 
 # Real Firebase config (has stray space in filename) - never commit
 android/google-services  org.json
+
+.vercel
+.env*
