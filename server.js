@@ -2872,6 +2872,10 @@ app.post('/api/orders/update-stage', requireRider, async (req, res) => {
     }
 
     // Mirror to Firestore via Admin SDK (mirror only — never authoritative).
+    // Resolve the real Firestore doc id the customer listens on: orders are
+    // stored under an auto-generated ID, but the rider knows the `FM-xxx` alias.
+    // Writing only the alias doc is why status taps didn't propagate to the
+    // customer's live listener — same bug class as the accept double-write.
     try {
       const db = adminDb();
       if (db) {
@@ -2883,13 +2887,33 @@ app.post('/api/orders/update-stage', requireRider, async (req, res) => {
           updatedAt: new Date(),
         };
         if (stage === 3) patch.deliveredAt = new Date();
-        await db.collection('orders').doc(normOrderId).set(patch, { merge: true });
+        let primaryFsId = normOrderId;
         try {
-          const rawId = String(orderId).trim();
-          if (rawId && rawId !== normOrderId) {
-            await db.collection('orders').doc(rawId).set(patch, { merge: true });
+          const qSnap = await db.collection('orders')
+            .where('orderId', '==', normOrderId)
+            .limit(1).get();
+          if (!qSnap.empty) {
+            primaryFsId = qSnap.docs.first.id;
+          } else {
+            const direct = await db.collection('orders').doc(normOrderId).get();
+            if (direct.exists) {
+              primaryFsId = direct.id;
+            } else {
+              const rawId = String(orderId).trim();
+              if (rawId && rawId !== normOrderId) {
+                const directRaw = await db.collection('orders').doc(rawId).get();
+                if (directRaw.exists) primaryFsId = directRaw.id;
+              }
+            }
           }
-        } catch (_) {}
+        } catch (docLookupErr) { console.error('update-stage fs doc-id lookup error:', docLookupErr.message); }
+
+        await db.collection('orders').doc(primaryFsId).set(patch, { merge: true });
+        // Also write any alternate doc id the rider / other listeners may use.
+        const extraIds = new Set([normOrderId, String(orderId).trim()].filter((s) => s && s !== primaryFsId));
+        for (const altId of extraIds) {
+          try { await db.collection('orders').doc(altId).set(patch, { merge: true }); } catch (_) {}
+        }
       }
     } catch (e) { console.error('update-stage fs mirror error:', e.message); }
 
