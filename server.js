@@ -2574,6 +2574,23 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
             }
           }
       } catch (docLookupErr) { console.error('accept fs doc-id lookup error:', docLookupErr.message); }
+        // TMP→FM race: rider may accept the TMP-xxx doc before the customer
+        // app reconciles it to the official FM-xxx id (and deletes the TMP doc).
+        // Collect every doc id linked to this order (orderId field, clientRef
+        // field, raw/TMP forms) so the accept survives reconcile either way.
+        const extraFsIds = new Set();
+        try {
+          const raw = String(rawOrderId).trim();
+          for (const key of [raw, orderId]) {
+            if (!key) continue;
+            const cSnap = await db.collection('orders')
+              .where('clientRef', '==', key)
+              .limit(5).get();
+            if (!cSnap.empty) cSnap.docs.forEach((d) => { if (d.id !== primaryId) extraFsIds.add(d.id); });
+          }
+          const raw2 = String(rawOrderId).trim();
+          if (raw2 && raw2 !== primaryId && raw2 !== orderId) extraFsIds.add(raw2);
+        } catch (e) { console.error('accept fs clientRef lookup error:', e.message); }
 
       // ATOMIC WRITE: re-check stage == 0 inside a Firestore transaction so
       // two riders can't both accept. If another rider got in first, this
@@ -2591,8 +2608,11 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
       };
       try {
         await db.runTransaction(async (tx) => {
-          if (primaryId) writeDoc(tx, primaryId, fsPatch);
-          if (primaryId !== orderId) writeDoc(tx, orderId, fsPatch);
+          if (primaryId) await writeDoc(tx, primaryId, fsPatch);
+          if (primaryId !== orderId) await writeDoc(tx, orderId, fsPatch);
+          for (const altId of extraFsIds) {
+            if (altId && altId !== primaryId && altId !== orderId) await writeDoc(tx, altId, fsPatch);
+          }
         });
       } catch (txErr) {
         const msg = String(txErr?.message || '').toLowerCase();
