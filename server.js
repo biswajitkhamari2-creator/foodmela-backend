@@ -1768,6 +1768,7 @@ const placeOrderHandler = async (req, res) => {
 
     const newOrder = {
       id:           finalOrderId,
+      orderId:      finalOrderId,  // ✅ ADD THIS - customer app expects orderId field
       order_number: finalOrderId,
       clientRef:    clientRef || null,
       customerName: customerName || 'Customer',
