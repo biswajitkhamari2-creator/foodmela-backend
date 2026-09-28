@@ -341,6 +341,29 @@ function sanitizeOrder(o, viewer) {
   const isOwner = viewer && viewer.phone === orderPhone;
   const isRider = viewer && (viewer.role === 'rider' || viewer.role === 'admin');
   const copy = { ...o };
+
+  const oid = copy.id || copy.orderId || copy.order_number;
+  if (oid) {
+    copy.id = oid;
+    copy.orderId = oid;
+    copy.order_number = oid;
+  }
+
+  let amt = 0;
+  if (typeof copy.amountValue === 'number' && !isNaN(copy.amountValue) && copy.amountValue > 0) amt = copy.amountValue;
+  else if (typeof copy.totalAmount === 'number' && !isNaN(copy.totalAmount) && copy.totalAmount > 0) amt = copy.totalAmount;
+  else if (typeof copy.total === 'number' && !isNaN(copy.total) && copy.total > 0) amt = copy.total;
+  else if (typeof copy.total === 'string') {
+    const p = parseFloat(copy.total.replace(/[^0-9.]/g, ''));
+    if (!isNaN(p)) amt = p;
+  }
+
+  if (amt > 0) {
+    copy.amountValue = amt;
+    copy.totalAmount = amt;
+    copy.total = `₹${amt % 1 === 0 ? amt : amt.toFixed(2)}`;
+  }
+
   if (isOwner || isRider) return copy; // full view for owner + assigned flow
   delete copy.deliveryOtp;
   delete copy.customerFcmToken;
@@ -401,18 +424,16 @@ function sendFcmToTopic(topic, title, body, data) {
       const token = await fcmAccessToken();
       if (!token) return resolve(false);
       const sa = fcmServiceAccount();
-      // WhatsApp-style incoming call: notification + data push. The
-      // `notification` block lets ANDROID ITSELF wake the screen and fire the
-      // full-screen intent (food_mela_orders channel, PRIORITY_MAX) even when
-      // the app is backgrounded/killed — Dart code alone cannot open a screen
-      // from those states. The app cancels by tag on accept/decline so no
-      // stale copy lingers. Data carries full order fields for the call UI.
+      // DATA-ONLY topic push (no notification block): OS-drawn strip kabhi
+      // nahi aata — app ka background handler fullScreenIntent wala local
+      // notification dikhata hai (WhatsApp-style full screen). Pehle notification
+      // block tha, isliye OS khud strip dikhata tha aur full-screen marta tha.
       const strData = {};
       for (const [k, v] of Object.entries(data || {})) {
         if (v !== undefined && v !== null) strData[k] = String(v);
       }
       const orderTag = String((data && data.orderId) || Date.now());
-      const payload = JSON.stringify({ message: { topic, notification: { title, body }, data: { ...strData, type: 'new_order', title, body, click_action: 'FLUTTER_NOTIFICATION_CLICK' }, android: { priority: 'high', notification: { sound: 'default', channel_id: 'food_mela_orders', tag: orderTag, visibility: 'PUBLIC', notification_priority: 'PRIORITY_MAX' } } } });
+      const payload = JSON.stringify({ message: { topic, data: { title, body, ...strData, type: 'new_order', click_action: 'FLUTTER_NOTIFICATION_CLICK' }, android: { priority: 'high', notification: { sound: 'default', channel_id: 'food_mela_orders', tag: orderTag, visibility: 'PUBLIC', notification_priority: 'PRIORITY_MAX' } } } });
       const req = https.request({ hostname: 'fcm.googleapis.com', path: `/v1/projects/${sa.project_id}/messages:send`, method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } }, (res) => {
         let d = '';
         res.on('data', (c) => { d += c; });
@@ -424,10 +445,29 @@ function sendFcmToTopic(topic, title, body, data) {
     } catch (_) { resolve(false); }
   });
 }
+// ─── FCM ONCE-ONLY DEDUP (server-side) ────────────────────────────────────
+// Ek orderId par new-order push SIRF EK BAAR jayega — chahe place handler,
+// paid-order path, watch poller ya cron kitni baar bhi fire karein. Upstash
+// SETNX atomic hai: do concurrent caller me se sirf ek jeetega, dusra skip.
+// TTL 24h — purane IDs auto-expire, memory kabhi bhar nahi sakti.
+const PUSHED_ORDERS_KEY = 'fm_pushed_orders_v1';
+async function alreadyPushed(orderId) {
+  try {
+    const key = `${PUSHED_ORDERS_KEY}:${String(orderId)}`;
+    const r = await upstashCommand(['SET', key, '1', 'EX', '86400', 'NX']);
+    // Upstash: result 'OK' = key nayi bani (pehli baar) → push karo.
+    // result null = key pehle se thi → skip (duplicate).
+    return r.result !== 'OK';
+  } catch (_) { return false; } // Upstash down → fail-open, push bhej do
+}
 function pushNewOrderToRiders(order) {
   // Fire-and-forget — never blocks the order response.
   setImmediate(async () => {
     try {
+      if (await alreadyPushed(order.id)) {
+        console.log(`🔇 FCM dedup: push already sent for ${order.id} — skipping repeat`);
+        return;
+      }
       const ok = await sendFcmToTopic(
         'rider_notifications',
         `🛵 New Order #${order.id}`,
@@ -591,7 +631,14 @@ function sendFcmToToken(token, title, body, data) {
       const fcmToken = await fcmAccessToken();
       if (!fcmToken) return resolve(false);
       const sa = fcmServiceAccount();
-      const payload = JSON.stringify({ message: { token, notification: { title, body }, data: { ...(data || {}), click_action: 'FLUTTER_NOTIFICATION_CLICK' }, android: { priority: 'high', notification: { sound: 'default', channel_id: 'food_mela_calls', visibility: 'PUBLIC', notification_priority: 'PRIORITY_MAX' } } } });
+      // WhatsApp-style full-screen: incoming_call pushes are DATA-ONLY (no
+      // top-level notification block). OS-drawn heads-up strip kabhi nahi
+      // aata — app ka fullScreenIntent wala local notification chalta hai.
+      // Baaki pushes (order status etc.) pehle jaise notification block ke saath.
+      const isCall = data && data.type === 'incoming_call';
+      const msgBody = { token, data: { title, body, ...(data || {}), click_action: 'FLUTTER_NOTIFICATION_CLICK' }, android: { priority: 'high', notification: { sound: 'default', channel_id: 'food_mela_calls', visibility: 'PUBLIC', notification_priority: 'PRIORITY_MAX' } } };
+      if (!isCall) msgBody.notification = { title, body };
+      const payload = JSON.stringify({ message: msgBody });
       const req = https.request({ hostname: 'fcm.googleapis.com', path: `/v1/projects/${sa.project_id}/messages:send`, method: 'POST', headers: { 'Authorization': `Bearer ${fcmToken}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } }, (res) => {
         let d = '';
         res.on('data', (c) => { d += c; });
@@ -614,6 +661,18 @@ app.post('/api/calls/:orderId/ring', async (req, res) => {
     const { callId, callerRole, receiverToken } = req.body || {};
     const viewer = viewerFrom(req);
     if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
+    // Once-only per callId: retry/re-ring se rider ko dobara push na jaye.
+    // (Call cancel/timeout ke baad naya callId banta hai, wo naya push payega.)
+    try {
+      const ringKey = `fm_rung_calls_v1:${String(callId || '')}`;
+      if (callId) {
+        const rr = await upstashCommand(['SET', ringKey, '1', 'EX', '3600', 'NX']);
+        if (rr.result !== 'OK') {
+          console.log(`🔇 RING dedup: push already sent for ${callId} — skipping repeat`);
+          return res.json({ success: true, pushed: true, duplicate: true });
+        }
+      }
+    } catch (_) {}
     // Lookup: Redis first, then Firestore via Admin SDK (app orders live ONLY
     // in Firestore — Redis-only lookup 404'd every Firestore-only order, so
     // the incoming-call push never fired).
@@ -819,8 +878,8 @@ function findOrderIndex(orders, searchId) {
   });
 }
 
-// ─── ROOT HEALTH CHECK ────────────────────────────────────────────────────────
-app.get('/', async (req, res) => {
+// ─── API HEALTH CHECK ─────────────────────────────────────────────────────────
+app.get('/api', async (req, res) => {
   const orders = await readOrders();
   res.json({
     status: 'ONLINE 🚀',
@@ -831,6 +890,21 @@ app.get('/', async (req, res) => {
     completedOrders: orders.filter(o => o.stage >= 1).length,
     timestamp: new Date().toISOString()
   });
+});
+app.get('/api/status', async (req, res) => {
+  const orders = await readOrders();
+  res.json({
+    status: 'ONLINE 🚀',
+    service: 'Food Mela Backend',
+    storage: 'Upstash Redis',
+    version: '4.1.0',
+    liveOrders: orders.filter(o => o.stage === 0 || o.stage === -1).length,
+    completedOrders: orders.filter(o => o.stage >= 1).length,
+    timestamp: new Date().toISOString()
+  });
+});
+app.get('/api/health', async (req, res) => {
+  res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
 // ─── DIAGNOSTIC: test-push (proves FCM topic → phone path) ─────────────────
@@ -1301,6 +1375,48 @@ app.post('/api/auth/refresh', async (req, res) => {
   }
 });
 
+// Direct Phone Login / Verification / Profile Fetch & Token Minting
+app.post('/api/auth/phone-login', maintenanceGate, async (req, res) => {
+  try {
+    const raw = String(req.body.phone || '').replace(/[^0-9]/g, '');
+    const phone = raw.slice(-10);
+    if (phone.length < 10) return res.status(400).json({ success: false, error: 'valid 10-digit phone required' });
+
+    let user = await readUser(phone);
+    if (!user || !user.phone) {
+      user = {
+        phone,
+        name: req.body.name || `Customer (${phone.slice(-4)})`,
+        email: '',
+        addresses: [
+          { title: 'Home 🏠', address: req.body.address || 'Birmaharajpur, Subarnapur, Odisha - 767018' }
+        ],
+        orderHistory: [],
+        createdAt: new Date().toISOString()
+      };
+      await writeUser(phone, user);
+    }
+
+    const apiToken = mintApiToken(phone, 'customer');
+    let firebaseToken = null;
+    try {
+      const authAdmin = adminAuth();
+      if (authAdmin) firebaseToken = await authAdmin.createCustomToken(phone, { phone_number: phone, role: 'customer' });
+    } catch (e) { /* ignore */ }
+
+    return res.json({
+      success: true,
+      phone,
+      name: user.name || null,
+      user,
+      apiToken,
+      firebaseToken
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // Website OTP registration — phone.email verified the number, so create the
 // Redis profile (same store the apps use). Firestore users/{phone} is written
 // by the apps when they next see this number; website never writes Firestore.
@@ -1431,8 +1547,125 @@ app.get('/api/orders/completed', requireRider, async (req, res) => {
 // GET order history for a customer phone – OWNER ONLY (IDOR kill).
 app.get('/api/user/:phone/orders', requireSelf, async (req, res) => {
   try {
-    const user = await readUser(req.params.phone);
-    res.json({ success: true, orders: user.orderHistory || [] });
+    const cleanPhone = String(req.params.phone || '').replace(/[^0-9]/g, '').slice(-10);
+    const user = await readUser(cleanPhone);
+    const ordersMap = new Map();
+
+    // 1. Existing orders in user's history
+    if (Array.isArray(user.orderHistory)) {
+      user.orderHistory.forEach(o => {
+        const oid = o.id || o.orderId || o.order_number;
+        if (oid) ordersMap.set(oid, o);
+      });
+    }
+
+    // 2. Orders from Redis global orders
+    try {
+      const allOrders = await readOrders();
+      allOrders.forEach(o => {
+        const op = String(o.phone || o.customerPhone || '').replace(/[^0-9]/g, '').slice(-10);
+        if (op === cleanPhone) {
+          const oid = o.id || o.orderId || o.order_number;
+          if (oid) {
+            const existing = ordersMap.get(oid) || {};
+            ordersMap.set(oid, { ...existing, ...o });
+          }
+        }
+      });
+    } catch (e) {
+      console.error('Redis orders merge error:', e.message);
+    }
+
+    // 3. Orders from Firestore (checking both customerPhone and phone)
+    try {
+      const db = adminDb();
+      if (db) {
+        const snap1 = await db.collection('orders')
+          .where('customerPhone', '==', cleanPhone)
+          .limit(500)
+          .get();
+        snap1.forEach(doc => {
+          const fo = { id: doc.id, ...doc.data() };
+          const oid = fo.id || fo.orderId || fo.order_number;
+          if (oid) {
+            const existing = ordersMap.get(oid) || {};
+            ordersMap.set(oid, { ...fo, ...existing });
+          }
+        });
+
+        const snap2 = await db.collection('orders')
+          .where('phone', '==', cleanPhone)
+          .limit(500)
+          .get();
+        snap2.forEach(doc => {
+          const fo = { id: doc.id, ...doc.data() };
+          const oid = fo.id || fo.orderId || fo.order_number;
+          if (oid) {
+            const existing = ordersMap.get(oid) || {};
+            ordersMap.set(oid, { ...fo, ...existing });
+          }
+        });
+      }
+    } catch (e) {
+      console.error('Firestore orders lookup error:', e.message);
+    }
+
+    const mergedList = Array.from(ordersMap.values()).sort((a, b) => {
+      const ta = new Date(a.placedAt || a.timestamp || a.createdAt || 0).getTime();
+      const tb = new Date(b.placedAt || b.timestamp || b.createdAt || 0).getTime();
+      return tb - ta;
+    });
+
+    res.json({ success: true, orders: mergedList.map(o => sanitizeOrder(o, req.apiAuth)) });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Clear/Reset Order History for a Customer Phone (clears old test/fake orders)
+app.post('/api/user/:phone/clear-orders', maintenanceGate, async (req, res) => {
+  try {
+    const cleanPhone = String(req.params.phone || '').replace(/[^0-9]/g, '').slice(-10);
+    if (!cleanPhone || cleanPhone.length < 10) {
+      return res.status(400).json({ success: false, error: 'Valid phone required' });
+    }
+
+    // 1. Clear Redis user order history
+    const user = await readUser(cleanPhone);
+    user.orderHistory = [];
+    await writeUser(cleanPhone, user);
+
+    // 2. Clear Redis global orders
+    try {
+      let allOrders = await readOrders();
+      allOrders = allOrders.filter(o => {
+        const op = String(o.phone || o.customerPhone || '').replace(/[^0-9]/g, '').slice(-10);
+        return op !== cleanPhone;
+      });
+      await writeOrders(allOrders);
+    } catch (e) {
+      console.error('clear global orders notice:', e.message);
+    }
+
+    // 3. Clear/Delete orders in Firestore
+    try {
+      const db = adminDb();
+      if (db) {
+        const snap1 = await db.collection('orders').where('customerPhone', '==', cleanPhone).get();
+        const batch1 = db.batch();
+        snap1.forEach(doc => batch1.delete(doc.ref));
+        await batch1.commit();
+
+        const snap2 = await db.collection('orders').where('phone', '==', cleanPhone).get();
+        const batch2 = db.batch();
+        snap2.forEach(doc => batch2.delete(doc.ref));
+        await batch2.commit();
+      }
+    } catch (e) {
+      console.error('firestore clear orders notice:', e.message);
+    }
+
+    res.json({ success: true, message: `All order history cleared for +91 ${cleanPhone}` });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
