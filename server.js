@@ -457,6 +457,27 @@ function pushNewOrderToRiders(order) {
 // app is killed. Safe to call as often as every 30s.
 // Setup: Vercel → Project → Settings → Cron Jobs → GET /api/orders/watch
 // every minute. No cron? Call it from the admin panel on an interval.
+// SELF-TRIGGER: placeOrderHandler bhi har successful place par isko
+// fire-and-forget call karta hai (triggerWatchPoller), taaki Cron na laga ho
+// tab bhi rider tak push pahunche — customer→rider gap ka asli fix.
+function triggerWatchPoller() {
+  // Fire-and-forget — order response kabhi block nahi hota.
+  // Watch endpoint ko CRON_SECRET chahiye; self-call me wahi bhejte hain.
+  setImmediate(async () => {
+    try {
+      const secret = process.env.CRON_SECRET || '';
+      if (!secret) return;
+      const port = process.env.PORT || 3000;
+      const host = process.env.VERCEL_URL
+        ? `https://${process.env.VERCEL_URL}`
+        : `http://127.0.0.1:${port}`;
+      await fetch(`${host}/api/orders/watch`, {
+        headers: { Authorization: `Bearer ${secret}` },
+        signal: AbortSignal.timeout(15000),
+      }).catch(() => {});
+    } catch (_) {}
+  });
+}
 const WATCHED_KEY = 'fm_watched_orders_v1';
 function firestoreGet(path) {
   return new Promise((resolve) => {
@@ -1548,6 +1569,7 @@ const placeOrderHandler = async (req, res) => {
 
     console.log(`🔔 NEW ORDER: ${finalOrderId} by ${customerName} (ref ${clientRef || "-"})`);
     pushNewOrderToRiders(newOrder); // background/killed-app ring via FCM
+    triggerWatchPoller(); // Firestore-direct orders bhi rider tak pahunche (Cron backup)
     mirrorOrderToFirestore(newOrder); // app + website live sync
     res.status(201).json({ success: true, order: newOrder, apiToken: mintApiToken(orderPhone, 'customer') });
   } catch (e) {
