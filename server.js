@@ -979,6 +979,7 @@ function mirrorOrderToFirestore(o) {
     db.collection('orders').doc(String(o.id)).set({
       orderId: String(o.id),
       order_number: String(o.order_number || o.id),
+      clientRef: o.clientRef || null,
       customerName: o.customerName || 'Customer',
       customerPhone: cleanPhone || String(o.phone || o.customerPhone || ''),
       address: o.address || '',
