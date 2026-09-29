@@ -803,19 +803,51 @@ async function readUser(phone) {
     const key = `fm_user_v1:${phone}`;
     const res = await upstashCommand(['GET', key]);
     if (res.result && res.result !== 'nil' && res.result !== null) {
-      return JSON.parse(res.result);
+      const parsed = JSON.parse(res.result);
+      if (parsed && (parsed.name || parsed.fullName)) {
+        return parsed;
+      }
     }
   } catch (e) {
     console.error(`Error reading user ${phone}:`, e.message);
   }
-  // Return default template if not found (as original getOrCreateUser did)
+  // Try Firestore users collection if Redis didn't have a name
+  try {
+    const db = adminDb();
+    if (db) {
+      const snap = await db.collection('users').doc(phone).get();
+      if (snap.exists) {
+        const d = snap.data() || {};
+        const userName = String(d.fullName || d.name || `${d.firstName || ''} ${d.lastName || ''}`).trim();
+        const user = {
+          phone,
+          name: userName,
+          fullName: userName,
+          email: d.email || '',
+          addresses: Array.isArray(d.addresses) ? d.addresses : (d.deliveryAddress ? [{ title: 'Home 🏠', address: d.deliveryAddress }] : [
+            { title: 'Home 🏠', address: 'Birmaharajpur, Subarnapur, Odisha - 767018' }
+          ]),
+          orderHistory: d.orderHistory || [],
+          createdAt: d.createdAt || new Date().toISOString()
+        };
+        if (userName) {
+          try {
+            await upstashCommand(['SET', `fm_user_v1:${phone}`, JSON.stringify(user)]);
+          } catch (_) {}
+        }
+        return user;
+      }
+    }
+  } catch (e) {
+    console.error(`Firestore user lookup for ${phone}:`, e.message);
+  }
+  // Return default template if not found
   return {
     phone,
     name: '',
     email: '',
     addresses: [
-      { title: 'Home 🏠', address: 'Flat 302, Saheed Nagar, Janpath Road, Bhubaneswar' },
-      { title: 'Work 🏢', address: 'Tower B, Infocity IT Park, Patia, Bhubaneswar' }
+      { title: 'Home 🏠', address: 'Birmaharajpur, Subarnapur, Odisha - 767018' }
     ],
     orderHistory: [],
     createdAt: new Date().toISOString()
@@ -1425,6 +1457,76 @@ app.post('/api/auth/phone-login', maintenanceGate, async (req, res) => {
         addresses: [
           { title: 'Home 🏠', address: req.body.address || 'Birmaharajpur, Subarnapur, Odisha - 767018' }
         ],
+        orderHistory: [],
+        createdAt: new Date().toISOString()
+      };
+      await writeUser(phone, user);
+    }
+
+    const apiToken = mintApiToken(phone, 'customer');
+    let firebaseToken = null;
+    try {
+      const authAdmin = adminAuth();
+      if (authAdmin) firebaseToken = await authAdmin.createCustomToken(phone, { phone_number: phone, role: 'customer' });
+    } catch (e) { /* ignore */ }
+
+    return res.json({
+      success: true,
+      phone,
+      name: user.name || null,
+      user,
+      apiToken,
+      firebaseToken
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Direct OTP Send (mock / demo / gateway)
+app.post('/api/auth/otp/send', maintenanceGate, async (req, res) => {
+  try {
+    const raw = String(req.body.phone || '').replace(/[^0-9]/g, '');
+    const phone = raw.slice(-10);
+    if (phone.length < 10) return res.status(400).json({ success: false, error: 'Valid 10-digit mobile number required' });
+
+    const otp = '1234';
+    try {
+      await upstashCommand(['SET', `fm_otp:${phone}`, otp, 'EX', '300']);
+    } catch (_) {}
+
+    return res.json({ success: true, message: `OTP sent to +91 ${phone}`, demoOtp: '1234' });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Direct OTP Verify
+app.post('/api/auth/otp/verify', maintenanceGate, async (req, res) => {
+  try {
+    const raw = String(req.body.phone || '').replace(/[^0-9]/g, '');
+    const phone = raw.slice(-10);
+    const otp = String(req.body.otp || '').trim();
+    if (phone.length < 10) return res.status(400).json({ success: false, error: 'Valid 10-digit mobile number required' });
+    if (!otp) return res.status(400).json({ success: false, error: 'OTP code required' });
+
+    let valid = (otp === '1234' || otp.length === 4 || otp.length === 6);
+    try {
+      const stored = await upstashCommand(['GET', `fm_otp:${phone}`]);
+      if (stored && stored.result && stored.result === otp) valid = true;
+    } catch (_) {}
+
+    if (!valid) {
+      return res.status(400).json({ success: false, error: 'Invalid verification code. Please enter 1234.' });
+    }
+
+    let user = await readUser(phone);
+    if (!user || !user.phone) {
+      user = {
+        phone,
+        name: `Customer (${phone.slice(-4)})`,
+        email: '',
+        addresses: [{ title: 'Home 🏠', address: 'Birmaharajpur, Subarnapur, Odisha - 767018' }],
         orderHistory: [],
         createdAt: new Date().toISOString()
       };
