@@ -2829,6 +2829,8 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
       return res.status(409).json({ success: false, error: 'Order already accepted', order: latest });
     }
 
+    const partnerId = String(req.body.riderPartnerId || req.body.partnerId || '').trim();
+    const assignedRiderId = partnerId || driverId || 'driver';
     const stamp = new Date().toISOString();
     const curVersion = Number(latest.statusVersion ?? 0);
     const updatedOrder = {
@@ -2837,11 +2839,13 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
       status: 'Order Accepted ✅',
       statusVersion: curVersion + 1,
       statusHistory: appendStatusHistory(latest, { from: Number(latest.stage ?? 0), to: 1, fromStatus: latest.status || null, toStatus: 'Order Accepted ✅', actor: driverId || null, actorName: driverName || null, opId: req.body.opId ? String(req.body.opId) : null }),
-      acceptedBy: driverId || 'driver',
+      acceptedBy: driverId || partnerId || 'driver',
       acceptedByName: driverName || 'Delivery Partner',
       riderName: driverName || 'Delivery Partner',
-      riderId: driverId || 'driver',
+      riderId: assignedRiderId,
+      riderPartnerId: partnerId || driverId || '',
       riderPhone: driverId || '',
+      acceptedByPhone: driverId || '',
       acceptedAt: stamp,
       updatedAt: stamp,
     };
@@ -2898,14 +2902,9 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
           acceptedByName: driverName || 'Delivery Partner',
           riderPhone: driverId || '',
           acceptedByPhone: driverId || '',
-          riderId: driverId || 'driver',
-          acceptedBy: driverId || 'driver',
-          // Also stamp the partnerId the rider app uses for call signaling
-          // (listenMyId) — the Firestore fast-path accept writes
-          // riderId=<partnerId>, so both writers must agree.
-          ...(String(req.body.riderPartnerId || req.body.partnerId || '').trim()
-            ? { riderPartnerId: String(req.body.riderPartnerId || req.body.partnerId).trim() }
-            : {}),
+          riderId: assignedRiderId,
+          acceptedBy: driverId || partnerId || 'driver',
+          riderPartnerId: partnerId || driverId || '',
           acceptedAt: new Date(),
           updatedAt: new Date(),
         };
