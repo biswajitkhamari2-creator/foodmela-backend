@@ -2900,8 +2900,12 @@ app.post('/api/orders/accept', requireRider, async (req, res) => {
               .limit(5).get();
             if (!cSnap.empty) cSnap.docs.forEach((d) => { if (d.id !== primaryId) extraFsIds.add(d.id); });
           }
+          // Only add rawOrderId if it's a TMP-xxx form (not a differently-formatted
+          // FM id). FM71234567 is already covered by primaryId FM-71234567; writing
+          // to FM71234567 creates a duplicate Firestore doc that appears as a second
+          // order in the customer app.
           const raw2 = String(rawOrderId).trim();
-          if (raw2 && raw2 !== primaryId && raw2 !== orderId) extraFsIds.add(raw2);
+          if (raw2 && raw2 !== primaryId && raw2 !== orderId && raw2.startsWith('TMP-')) extraFsIds.add(raw2);
         } catch (e) { console.error('accept fs clientRef lookup error:', e.message); }
 
       // ATOMIC WRITE: re-check stage == 0 inside a Firestore transaction so
