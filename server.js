@@ -1943,15 +1943,17 @@ async function phonepeOrderStatus(merchantOrderId) {
 // Shared paid-order writer — same shape as PhonePe callback (COD/cart/rider/admin untouched).
 async function createPaidOrder({ txnid, customerName, phone, address, items, totalAmount, gatewayRef, gateway }) {
   let normalizedTxnid = String(txnid || '').trim();
+  const clientRef = normalizedTxnid || null;
   if (!normalizedTxnid.startsWith('FM-')) {
     normalizedTxnid = `FM-${normalizedTxnid.replace(/^FM/i, '')}`;
   }
   const orders = await readOrders();
-  const existing = orders.find(o => o.id === normalizedTxnid || o.orderId === normalizedTxnid || o.id === txnid || o.orderId === txnid);
+  const existing = orders.find(o => o.id === normalizedTxnid || o.orderId === normalizedTxnid || o.clientRef === clientRef);
   if (existing) return { order: existing, duplicate: true };
   const cleanPhone = String(phone || '').replace(/[^0-9]/g, '').slice(-10);
   const newOrder = {
     id: normalizedTxnid,
+    clientRef: clientRef,
     customerName: customerName || 'Customer',
     phone: cleanPhone || phone || 'unknown',
     customerPhone: cleanPhone || phone || 'unknown',
