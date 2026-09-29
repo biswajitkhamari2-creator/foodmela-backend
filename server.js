@@ -3400,6 +3400,108 @@ app.delete('/api/orders/clear-delivered', async (req, res) => {
   }
 });
 
+// CLEAR ALL ORDERS – ADMIN ONLY.
+// Wipes all orders from Redis, Firestore, and per-user order histories.
+async function clearAllOrdersHandler(req, res) {
+  try {
+    const authHeader = String(req.headers.authorization || '');
+    const token = authHeader.replace(/^Bearer\s+/i, '');
+    const secretHeader = String(req.headers['x-admin-secret'] || '');
+    const cronSecret = process.env.CRON_SECRET || '';
+    const apiSecret = process.env.API_TOKEN_SECRET || '';
+
+    const viewer = viewerFrom(req);
+    const isCron = cronSecret && (token === cronSecret || secretHeader === cronSecret);
+    const isSecret = apiSecret && (token === apiSecret || secretHeader === apiSecret);
+    const isAdmin = (viewer && viewer.role === 'admin') || isCron || isSecret || await isAdminCaller(token);
+
+    if (!isAdmin) {
+      return res.status(403).json({ success: false, error: 'Admin only' });
+    }
+
+    // 1. Delete all order documents from Firestore
+    let firestoreDeleted = 0;
+    try {
+      const db = adminDb();
+      if (db) {
+        const snap = await db.collection('orders').get();
+        const batchSize = 100;
+        let batch = db.batch();
+        let count = 0;
+        for (const doc of snap.docs) {
+          batch.delete(doc.ref);
+          count++;
+          firestoreDeleted++;
+          if (count >= batchSize) {
+            await batch.commit();
+            batch = db.batch();
+            count = 0;
+          }
+        }
+        if (count > 0) {
+          await batch.commit();
+        }
+      }
+    } catch (e) {
+      console.error('Firestore clear error:', e.message);
+    }
+
+    // 2. Clear Redis orders and auxiliary keys
+    await upstashCommand(['DEL', ORDERS_KEY]);
+    await upstashCommand(['DEL', PAYMENTS_KEY]);
+    await upstashCommand(['DEL', WATCHED_KEY]);
+
+    // 3. Clear pushed keys in Redis
+    try {
+      const pushedKeys = await upstashCommand(['KEYS', 'fm_pushed_orders_v1:*']);
+      if (pushedKeys.result && Array.isArray(pushedKeys.result) && pushedKeys.result.length > 0) {
+        for (const pk of pushedKeys.result) {
+          await upstashCommand(['DEL', pk]);
+        }
+      }
+    } catch (e) {
+      console.error('Redis pushed keys clear error:', e.message);
+    }
+
+    // 4. Clear orderHistory from all user records in Redis
+    let usersCleared = 0;
+    try {
+      const uKeys = await upstashCommand(['KEYS', 'fm_user_v1:*']);
+      if (uKeys.result && Array.isArray(uKeys.result)) {
+        for (const uk of uKeys.result) {
+          const raw = await upstashCommand(['GET', uk]);
+          if (raw.result && raw.result !== 'nil') {
+            try {
+              const uData = JSON.parse(raw.result);
+              if (uData.orderHistory && uData.orderHistory.length > 0) {
+                uData.orderHistory = [];
+                await upstashCommand(['SET', uk, JSON.stringify(uData)]);
+                usersCleared++;
+              }
+            } catch (_) {}
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Redis user history clear error:', e.message);
+    }
+
+    console.log(`🧹 CLEAR-ALL ORDERS: deleted ${firestoreDeleted} Firestore docs, cleared ${usersCleared} user histories, wiped Redis orders`);
+    res.json({
+      success: true,
+      message: 'All orders cleared successfully from server, Firestore, and user histories',
+      firestoreDeleted,
+      usersCleared,
+    });
+  } catch (e) {
+    console.error('Clear all orders error:', e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+}
+app.post('/api/admin/orders/clear-all', clearAllOrdersHandler);
+app.delete('/api/admin/orders/clear-all', clearAllOrdersHandler);
+app.post('/api/orders/clear-all', clearAllOrdersHandler);
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // IN-APP AUDIO CALLING (Agora RTC + Cloud Recording → Firebase Storage)
 // Numbers stay hidden: VoIP only, channel = order_<orderId>, active orders only.
