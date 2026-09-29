@@ -1375,9 +1375,26 @@ app.post('/api/auth/phone-email/verify', maintenanceGate, async (req, res) => {
       const first = String(data.user_first_name ?? '').trim();
       const last = String(data.user_last_name ?? '').trim();
       let name = `${first} ${last}`.trim();
-      const existingUser = await readUser(phone);
-      if (!name && existingUser && existingUser.name) {
-        name = existingUser.name;
+      let existingUser = await readUser(phone);
+      if (!name && existingUser && (existingUser.fullName || existingUser.name)) {
+        name = existingUser.fullName || existingUser.name;
+      }
+      if (name && existingUser) {
+        existingUser.name = name;
+        existingUser.fullName = name;
+        await writeUser(phone, existingUser);
+        try {
+          const db = adminDb();
+          if (db) {
+            await db.collection('users').doc(phone).set({
+              phone,
+              name,
+              fullName: name,
+              role: 'customer',
+              updatedAt: new Date()
+            }, { merge: true });
+          }
+        } catch (_) {}
       }
       let firebaseToken = null;
       try {
@@ -1402,9 +1419,26 @@ app.post('/api/auth/phone-email/verify', maintenanceGate, async (req, res) => {
     const first = String(data.first_name || data.user_first_name || '').trim();
     const last = String(data.last_name || data.user_last_name || '').trim();
     let name = `${first} ${last}`.trim();
-    const existingUser = await readUser(phone);
-    if (!name && existingUser && existingUser.name) {
-      name = existingUser.name;
+    let existingUser = await readUser(phone);
+    if (!name && existingUser && (existingUser.fullName || existingUser.name)) {
+      name = existingUser.fullName || existingUser.name;
+    }
+    if (name && existingUser) {
+      existingUser.name = name;
+      existingUser.fullName = name;
+      await writeUser(phone, existingUser);
+      try {
+        const db = adminDb();
+        if (db) {
+          await db.collection('users').doc(phone).set({
+            phone,
+            name,
+            fullName: name,
+            role: 'customer',
+            updatedAt: new Date()
+          }, { merge: true });
+        }
+      } catch (_) {}
     }
     let firebaseToken = null;
     try {
