@@ -432,8 +432,25 @@ function sendFcmToTopic(topic, title, body, data) {
       for (const [k, v] of Object.entries(data || {})) {
         if (v !== undefined && v !== null) strData[k] = String(v);
       }
-      const orderTag = String((data && data.orderId) || Date.now());
-      const payload = JSON.stringify({ message: { topic, data: { title, body, ...strData, type: 'new_order', click_action: 'FLUTTER_NOTIFICATION_CLICK' }, android: { priority: 'high', notification: { sound: 'default', channel_id: 'food_mela_orders', tag: orderTag, visibility: 'PUBLIC', notification_priority: 'PRIORITY_MAX' } } } });
+      // Set collapse_key and a fixed tag so Android OS collapses/replaces order notifications
+      // in the notification drawer instead of stacking multiple notifications.
+      const payload = JSON.stringify({
+        message: {
+          topic,
+          data: { title, body, ...strData, type: 'new_order', click_action: 'FLUTTER_NOTIFICATION_CLICK' },
+          android: {
+            priority: 'high',
+            collapse_key: 'foodmela_rider_orders',
+            notification: {
+              sound: 'default',
+              channel_id: 'food_mela_orders',
+              tag: 'foodmela_rider_order',
+              visibility: 'PUBLIC',
+              notification_priority: 'PRIORITY_MAX'
+            }
+          }
+        }
+      });
       const req = https.request({ hostname: 'fcm.googleapis.com', path: `/v1/projects/${sa.project_id}/messages:send`, method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } }, (res) => {
         let d = '';
         res.on('data', (c) => { d += c; });
@@ -636,7 +653,23 @@ function sendFcmToToken(token, title, body, data) {
       // aata — app ka fullScreenIntent wala local notification chalta hai.
       // Baaki pushes (order status etc.) pehle jaise notification block ke saath.
       const isCall = data && data.type === 'incoming_call';
-      const msgBody = { token, data: { title, body, ...(data || {}), click_action: 'FLUTTER_NOTIFICATION_CLICK' }, android: { priority: 'high', notification: { sound: 'default', channel_id: 'food_mela_calls', visibility: 'PUBLIC', notification_priority: 'PRIORITY_MAX' } } };
+      const channelId = isCall ? 'food_mela_calls' : 'food_mela_orders';
+      const tag = isCall ? 'foodmela_call' : 'foodmela_customer_order';
+      const msgBody = {
+        token,
+        data: { title, body, ...(data || {}), click_action: 'FLUTTER_NOTIFICATION_CLICK' },
+        android: {
+          priority: 'high',
+          collapse_key: isCall ? 'foodmela_calls' : 'foodmela_customer_orders',
+          notification: {
+            sound: 'default',
+            channel_id: channelId,
+            tag: tag,
+            visibility: 'PUBLIC',
+            notification_priority: 'PRIORITY_MAX'
+          }
+        }
+      };
       if (!isCall) msgBody.notification = { title, body };
       const payload = JSON.stringify({ message: msgBody });
       const req = https.request({ hostname: 'fcm.googleapis.com', path: `/v1/projects/${sa.project_id}/messages:send`, method: 'POST', headers: { 'Authorization': `Bearer ${fcmToken}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } }, (res) => {
