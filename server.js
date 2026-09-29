@@ -1803,9 +1803,35 @@ const placeOrderHandler = async (req, res) => {
     }
 
     console.log(`🔔 NEW ORDER: ${finalOrderId} by ${customerName} (ref ${clientRef || "-"})`);
-    pushNewOrderToRiders(newOrder); // background/killed-app ring via FCM
-    triggerWatchPoller(); // Firestore-direct orders bhi rider tak pahunche (Cron backup)
-    mirrorOrderToFirestore(newOrder); // app + website live sync
+    // On Vercel, the lambda exits when res is sent — setImmediate/fire-and-forget
+    // never completes. Run critical side-effects BEFORE responding, with a cap
+    // so a slow FCM call never blocks the customer for more than 3s.
+    await Promise.allSettled([
+      (async () => {
+        try {
+          if (await alreadyPushed(newOrder.id)) {
+            console.log(`🔇 FCM dedup: push already sent for ${newOrder.id} — skipping`);
+            return;
+          }
+          const ok = await sendFcmToTopic(
+            'rider_notifications',
+            `🛵 New Order #${newOrder.id}`,
+            `${newOrder.customerName || 'Customer'} • ₹${Math.floor(newOrder.amountValue || 0)} — Tap to Accept`,
+            {
+              orderId: String(newOrder.id),
+              amount: String(Math.floor(newOrder.amountValue || 0)),
+              customerName: newOrder.customerName || 'Customer',
+              address: newOrder.address || '',
+              customerPhone: newOrder.phone || newOrder.customerPhone || '',
+              items: typeof newOrder.items === 'string' ? newOrder.items : '',
+              categoryLabel: newOrder.orderCategoryLabel || '',
+            },
+          );
+          console.log(ok ? `📲 FCM push sent for ${newOrder.id}` : `⚠️ FCM push skipped/failed for ${newOrder.id}`);
+        } catch (e) { console.error('FCM push notice:', e.message); }
+      })(),
+      mirrorOrderToFirestore(newOrder),
+    ].map(p => Promise.race([p, new Promise(r => setTimeout(r, 3000))])));
     res.status(201).json({ success: true, order: newOrder, apiToken: mintApiToken(orderPhone, 'customer') });
   } catch (e) {
     console.error('Place order error:', e);
@@ -1989,8 +2015,30 @@ async function createPaidOrder({ txnid, customerName, phone, address, items, tot
   // Payment ledger — every gateway transition lands here so the admin
   // Payments page shows the full trail without any gateway login.
   try { await logPayment({ ...newOrder, payStatus: 'PAID' }); } catch (e) { console.error('pay ledger notice:', e.message); }
-  pushNewOrderToRiders(newOrder);
-  mirrorOrderToFirestore(newOrder);
+  // Run FCM push + Firestore mirror before returning so Vercel lambda
+  // doesn't exit before these complete (same fix as COD path).
+  await Promise.allSettled([
+    (async () => {
+      try {
+        if (await alreadyPushed(newOrder.id)) return;
+        const ok = await sendFcmToTopic(
+          'rider_notifications',
+          `🛵 New Order #${newOrder.id}`,
+          `${newOrder.customerName || 'Customer'} • ₹${Math.floor(newOrder.amountValue || 0)} — Tap to Accept`,
+          {
+            orderId: String(newOrder.id),
+            amount: String(Math.floor(newOrder.amountValue || 0)),
+            customerName: newOrder.customerName || 'Customer',
+            address: newOrder.address || '',
+            customerPhone: newOrder.phone || newOrder.customerPhone || '',
+            items: typeof newOrder.items === 'string' ? newOrder.items : '',
+          },
+        );
+        console.log(ok ? `📲 FCM push sent for ${newOrder.id}` : `⚠️ FCM push skipped/failed for ${newOrder.id}`);
+      } catch (e) { console.error('FCM push notice:', e.message); }
+    })(),
+    mirrorOrderToFirestore(newOrder),
+  ].map(p => Promise.race([p, new Promise(r => setTimeout(r, 3000))])));
   return { order: newOrder, duplicate: false };
 }
 
