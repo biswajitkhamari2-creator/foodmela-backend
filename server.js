@@ -3286,12 +3286,11 @@ app.post('/api/orders/update-stage', requireRider, async (req, res) => {
           }
         } catch (docLookupErr) { console.error('update-stage fs doc-id lookup error:', docLookupErr.message); }
 
+        // ONLY write to the canonical Firestore doc. The previous code also
+        // wrote to normOrderId / orderId docs, creating duplicates when the
+        // caller's ID differs from the Firestore doc ID. The orderId field
+        // already carries the canonical ID for all downstream queries.
         await db.collection('orders').doc(primaryFsId).set(patch, { merge: true });
-        // Also write any alternate doc id the rider / other listeners may use.
-        const extraIds = new Set([normOrderId, String(orderId).trim()].filter((s) => s && s !== primaryFsId));
-        for (const altId of extraIds) {
-          try { await db.collection('orders').doc(altId).set(patch, { merge: true }); } catch (_) {}
-        }
       }
     } catch (e) { console.error('update-stage fs mirror error:', e.message); }
 
