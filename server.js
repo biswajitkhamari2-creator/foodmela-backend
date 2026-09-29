@@ -2643,9 +2643,9 @@ app.post('/api/payu/initiate', async (req, res) => {
     };
     await saveDraftOrder(txnid, draftData);
 
-    const defaultCallback = 'https://food-mela-backend.vercel.app/api/payu/callback';
-    const surl = defaultCallback;
-    const furl = defaultCallback;
+    const defaultCallback = process.env.PAYU_CALLBACK_URL || 'https://foodmela.online/api/payu/callback';
+    const surl = req.body.callbackUrl || defaultCallback;
+    const furl = req.body.callbackUrl || defaultCallback;
 
     // PayU hash sequence: key|txnid|amount|productinfo|firstname|email|udf1..udf10|SALT
     const udfs = ['', '', '', '', '', '', '', '', '', ''];
@@ -2720,7 +2720,7 @@ app.all('/api/payu/callback', async (req, res) => {
       });
 
       console.log(`✅ PAID ORDER via PayU: ${txnid} by ${order.customerName} (₹${d.amount})`);
-      return res.redirect(303, `https://foodmela.online/track/${encodeURIComponent(txnid)}?paid=1`);
+      return res.redirect(303, `https://foodmela.online/?paid=1&orderId=${encodeURIComponent(txnid)}`);
     } else {
       console.warn(`❌ PayU Payment Not Successful: ${txnid} (${d.error_Message || d.error || 'failed'})`);
       return res.redirect(303, `https://foodmela.online/?payment_error=${encodeURIComponent(d.error_Message || 'Payment Failed')}&orderId=${encodeURIComponent(txnid)}`);
