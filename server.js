@@ -3521,6 +3521,73 @@ app.post('/api/orders/update-stage', requireRider, async (req, res) => {
   }
 });
 
+// ─── COD → PREPAID SWITCH ───────────────────────────────────────────────
+// Customer paid online (PhonePe/PayU) AFTER placing a COD order.
+// Marks the SAME order prepaid (no duplicate), mirrors to Firestore,
+// notifies admin ledger + rider via FCM. Idempotent per orderId.
+app.post('/api/orders/switch-to-prepaid', maintenanceGate, async (req, res) => {
+  try {
+    const t = verifyApiToken(bearerToken(req));
+    const { orderId, gateway, gatewayRef } = req.body || {};
+    if (!orderId) return res.status(400).json({ success: false, error: 'orderId required' });
+    const normId = String(orderId).trim().startsWith('FM-') ? String(orderId).trim() : `FM-${String(orderId).trim().replace(/^FM/i, '')}`;
+    const orders = await readOrders();
+    const idx = findOrderIndex(orders, orderId);
+    if (idx === -1) return res.status(404).json({ success: false, error: 'Order not found' });
+    const o = orders[idx];
+    // Owner check: customer token phone must match order phone (admin bypasses).
+    const orderPhone = String(o.phone || o.customerPhone || '').replace(/[^0-9]/g, '').slice(-10);
+    if ((!t || (t.role !== 'admin' && t.phone !== orderPhone))) {
+      return res.status(403).json({ success: false, error: 'Only the ordering customer can switch payment' });
+    }
+    // Already prepaid → idempotent success, no duplicate notify.
+    if (String(o.paymentMode || '').toUpperCase().includes('PREPAID') || o.paymentStatus === 'PAID') {
+      return res.json({ success: true, order: sanitizeOrder(o, t || { phone: orderPhone, role: 'customer' }), alreadyPrepaid: true });
+    }
+    // Only unaccepted COD orders can switch (rider already en route = too late).
+    if (Number(o.stage || 0) !== 0) {
+      return res.status(409).json({ success: false, error: 'Order already accepted — payment cannot be changed' });
+    }
+    const gw = String(gateway || 'PhonePe');
+    const ref = String(gatewayRef || '');
+    o.paymentMode = 'PREPAID';
+    o.paymentStatus = 'PAID';
+    o.paymentGateway = gw;
+    o.gatewayTxnId = ref;
+    o.address = `${String(o.address || '').replace(/\s*\[(COD|CASH ON DELIVERY)\]/gi, '').trim()} [PREPAID - PAID ONLINE (${gw}${ref ? `: ${ref}` : ''})]`;
+    o.updatedAt = new Date().toISOString();
+    await writeOrders(orders);
+    try { mirrorOrderToFirestore(o); } catch (_) {}
+    // Firestore direct patch (payment fields aren't in mirror's allowlist).
+    try {
+      const db = adminDb();
+      if (db) {
+        await db.collection('orders').doc(String(o.id)).set({
+          paymentMode: 'PREPAID',
+          paymentStatus: 'PAID',
+          address: o.address,
+          updatedAt: new Date(),
+        }, { merge: true });
+      }
+    } catch (e) { console.error('switch-prepaid fs patch notice:', e.message); }
+    // Admin ledger trail.
+    try { await logPayment({ ...o, payStatus: 'PAID', gateway: gw }); } catch (e) { console.error('switch-prepaid ledger notice:', e.message); }
+    // Notify rider (topic) + customer history is auto-synced via Firestore stream.
+    try {
+      await sendFcmToTopic(
+        'rider_notifications',
+        `💰 Order #${o.id} switched to PREPAID`,
+        `${o.customerName || 'Customer'} paid online — collect NOTHING on delivery`,
+        { orderId: String(o.id), type: 'payment_switched', paymentMode: 'PREPAID' },
+      );
+    } catch (e) { console.error('switch-prepaid fcm notice:', e.message); }
+    console.log(`💰 ORDER ${normId} COD → PREPAID via ${gw}`);
+    res.json({ success: true, order: sanitizeOrder(o, t || { phone: orderPhone, role: 'customer' }) });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // Past Orders (Delivered only) – OWNER ONLY. Previously ANYONE could dump
 // ALL delivered orders (no phone → everything). Now scoped to the token.
 app.get('/api/orders/past', async (req, res) => {
