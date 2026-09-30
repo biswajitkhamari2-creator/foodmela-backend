@@ -684,6 +684,69 @@ function sendFcmToToken(token, title, body, data) {
   });
 }
 
+// ── POST /api/calls/:orderId/request { callerId, callerRole } ──────────
+// Call access gate: ONLY the order's customer ↔ assigned rider, ONLY while
+// the order is active (stage 0-2). Delivered (3+) / cancelled → 403.
+// Rider→rider calls are impossible by design (no shared order, not a member).
+app.post('/api/calls/:orderId/request', maintenanceGate, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { callerId, callerRole } = req.body || {};
+    if (!['customer', 'rider'].includes(String(callerRole))) {
+      return res.status(400).json({ success: false, error: 'callerRole must be customer or rider' });
+    }
+    const viewer = viewerFrom(req);
+    if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
+    let order = null;
+    try {
+      const orders = await readOrders();
+      order = orders.find(o => o.id === orderId || o.orderId === orderId) || null;
+    } catch (_) {}
+    if (!order) {
+      try {
+        const db = adminDb();
+        if (db) {
+          const snap = await db.collection('orders').doc(String(orderId)).get();
+          if (snap.exists) order = { id: orderId, ...snap.data() };
+        }
+      } catch (e) { console.error('call-request fs lookup notice:', e.message); }
+    }
+    if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
+    // Delivered / cancelled → calling disabled for everyone.
+    const stage = Number(order.stage ?? 0);
+    const status = String(order.status || '').toLowerCase();
+    if (stage >= 3 || stage === -1 || status.includes('cancel') || status.includes('deliver')) {
+      return res.status(403).json({ success: false, error: 'Order completed — calling disabled' });
+    }
+    // Membership: customer phone or assigned rider only.
+    const orderPhone = String(order.phone || order.customerPhone || '').replace(/[^0-9]/g, '').slice(-10);
+    const riderIds = [order.acceptedBy, order.riderId, order.riderPhone,
+      order.acceptedByPhone, order.riderPartnerId].map((v) => String(v || ''));
+    const riderMatch = viewer.role === 'rider' && riderIds.some((id) =>
+      id !== '' && (id === viewer.phone
+        || (id.replace(/[^0-9]/g, '').slice(-10) === viewer.phone
+          && viewer.phone.replace(/[^0-9]/g, '').length >= 10)));
+    const isMember = viewer.role === 'admin'
+      || viewer.phone === orderPhone
+      || riderMatch;
+    if (!isMember) return res.status(403).json({ success: false, error: 'Not part of this order' });
+    // Role must match the caller's real side (customer can't pose as rider).
+    if (viewer.role !== 'admin') {
+      if (String(callerRole) === 'customer' && viewer.phone !== orderPhone) {
+        return res.status(403).json({ success: false, error: 'Not part of this order' });
+      }
+      if (String(callerRole) === 'rider' && !riderMatch) {
+        return res.status(403).json({ success: false, error: 'Not part of this order' });
+      }
+    }
+    const callId = `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    console.log(`📞 CALL REQUEST ${callId} on ${orderId} by ${callerRole} ${String(callerId || '').slice(-4)}`);
+    res.json({ success: true, callId, channelName: `order_${orderId}`, log: { receiverRole: callerRole === 'customer' ? 'rider' : 'customer' } });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // ── POST /api/calls/:orderId/ring { callId, callerRole, receiverToken? } ──
 // WhatsApp-style incoming-call push. CALLER MUST PROVE ORDER MEMBERSHIP:
 // the apiToken phone must be the order's customer or its assigned rider —
