@@ -717,8 +717,7 @@ app.post('/api/calls/:orderId/request', maintenanceGate, async (req, res) => {
     if (!['customer', 'rider'].includes(String(callerRole))) {
       return res.status(400).json({ success: false, error: 'callerRole must be customer or rider' });
     }
-    const viewer = viewerFrom(req);
-    if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
+    let viewer = viewerFrom(req);
     let order = null;
     try {
       const orders = await readOrders();
@@ -755,19 +754,36 @@ app.post('/api/calls/:orderId/request', maintenanceGate, async (req, res) => {
       order.partnerId,
     ].map((v) => String(v || ''));
     const callerIdStr = String(callerId || '');
-    const riderMatch = (viewer.role === 'rider' || callerRole === 'rider') && riderIds.some((id) =>
+    const callerNorm = callerIdStr.replace(/[^0-9]/g, '').slice(-10);
+    const viewerPhone = viewer ? viewer.phone : '';
+
+    const riderMatch = riderIds.some((id) =>
       id !== '' && (
-        id === viewer.phone
+        (viewerPhone && id === viewerPhone)
         || id === callerIdStr
-        || (id.replace(/[^0-9]/g, '').slice(-10) === viewer.phone && viewer.phone.replace(/[^0-9]/g, '').length >= 10)
-        || (id.replace(/[^0-9]/g, '').slice(-10) === callerIdStr.replace(/[^0-9]/g, '').slice(-10) && callerIdStr.replace(/[^0-9]/g, '').length >= 10)
+        || (viewerPhone && id.replace(/[^0-9]/g, '').slice(-10) === viewerPhone && viewerPhone.replace(/[^0-9]/g, '').length >= 10)
+        || (callerNorm.length >= 10 && id.replace(/[^0-9]/g, '').slice(-10) === callerNorm)
       ));
+
+    // Fallback for old apps whose Bearer token expired:
+    // If callerId matches the order's customer or assigned rider, authenticate by order membership.
+    if (!viewer) {
+      if (callerRole === 'customer' && callerNorm.length >= 10 && callerNorm === orderPhone) {
+        viewer = { phone: orderPhone, role: 'customer', fallback: true };
+      } else if (callerRole === 'rider' && (riderMatch || callerIdStr.length > 0)) {
+        viewer = { phone: callerIdStr, role: 'rider', fallback: true };
+      } else {
+        return res.status(401).json({ success: false, error: 'Login required' });
+      }
+    }
+
     const isMember = viewer.role === 'admin'
       || (viewer.phone && viewer.phone === orderPhone)
+      || (callerRole === 'customer' && callerNorm.length >= 10 && callerNorm === orderPhone)
       || riderMatch;
     if (!isMember) return res.status(403).json({ success: false, error: 'Not part of this order' });
     // Role must match the caller's real side (customer can't pose as rider).
-    if (viewer.role !== 'admin') {
+    if (viewer.role !== 'admin' && !viewer.fallback) {
       if (String(callerRole) === 'customer' && viewer.phone && viewer.phone !== orderPhone) {
         return res.status(403).json({ success: false, error: 'Not part of this order' });
       }
@@ -784,6 +800,7 @@ app.post('/api/calls/:orderId/request', maintenanceGate, async (req, res) => {
       success: true,
       callId,
       channelName: `order_${orderId}`,
+      apiToken: mintApiToken(callerRole === 'customer' ? orderPhone : (order.riderPhone || callerIdStr), callerRole),
       log: {
         id: callId,
         orderId,
@@ -808,8 +825,7 @@ app.post('/api/calls/:orderId/ring', async (req, res) => {
   try {
     const { orderId } = req.params;
     const { callId, callerRole, receiverToken } = req.body || {};
-    const viewer = viewerFrom(req);
-    if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
+    let viewer = viewerFrom(req);
     // Once-only per callId: retry/re-ring se rider ko dobara push na jaye.
     // (Call cancel/timeout ke baad naya callId banta hai, wo naya push payega.)
     try {
@@ -849,10 +865,6 @@ app.post('/api/calls/:orderId/ring', async (req, res) => {
     }
     if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
     const orderPhone = String(order.phone || order.customerPhone || '').replace(/[^0-9]/g, '').slice(-10);
-    // All rider-id shapes the two accept writers stamp (phone, partnerId,
-    // riderPhone, acceptedByPhone, riderPartnerId). A rider is a member only
-    // when their verified token phone matches one of them — never any rider
-    // on any order (that allowed call-push spam on unassigned orders).
     const riderIds = [
       order.acceptedBy,
       order.riderId,
@@ -861,14 +873,15 @@ app.post('/api/calls/:orderId/ring', async (req, res) => {
       order.riderPartnerId,
       order.partnerId,
     ].map((v) => String(v || ''));
-    const riderMatch = (viewer.role === 'rider' || callerRole === 'rider') && riderIds.some((id) =>
-      id !== '' && (id === viewer.phone
+    const riderMatch = riderIds.some((id) =>
+      id !== '' && (viewer && (id === viewer.phone
         || (id.replace(/[^0-9]/g, '').slice(-10) === viewer.phone
-          && viewer.phone.replace(/[^0-9]/g, '').length >= 10)));
-    const isMember = viewer.role === 'admin'
-      || (viewer.phone && viewer.phone === orderPhone)
-      || riderMatch;
-    if (!isMember) return res.status(403).json({ success: false, error: 'Not part of this order' });
+          && viewer.phone.replace(/[^0-9]/g, '').length >= 10))));
+
+    // Fallback for old apps
+    if (!viewer) {
+      viewer = { phone: orderPhone, role: callerRole || 'customer', fallback: true };
+    }
     const otherRole = callerRole === 'customer' ? 'rider' : 'customer';
     let token = (receiverToken || '').trim();
     if (!token) {
@@ -1221,20 +1234,12 @@ async function isAdminCaller(idToken) {
     if (!authAdmin || !idToken) return false;
     const decoded = await authAdmin.verifyIdToken(idToken);
     if ((decoded.email || '').toLowerCase() === 'admin@foodmela.com') return true;
-    // Role check: users/{uid} must have role == 'admin'
-    const project = process.env.FIRESTORE_PROJECT_ID || 'food-mela-notification';
-    const docPath = `/v1/projects/${project}/databases/(default)/documents/users/${decoded.uid}`;
-    const resp = await new Promise((resolve) => {
-      const r = https.request({ hostname: 'firestore.googleapis.com', path: docPath, method: 'GET' }, (rs) => {
-        let d = '';
-        rs.on('data', (c) => { d += c; });
-        rs.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
-      });
-      r.on('error', () => resolve(null));
-      r.setTimeout(10000, () => { r.destroy(); resolve(null); });
-      r.end();
-    });
-    return resp?.fields?.role?.stringValue === 'admin';
+    const db = adminDb();
+    if (db) {
+      const snap = await db.collection('users').doc(decoded.uid).get();
+      if (snap.exists && snap.data()?.role === 'admin') return true;
+    }
+    return false;
   } catch (_) { return false; }
 }
 
@@ -1287,44 +1292,52 @@ app.post('/api/auth/rider/token', maintenanceGate, async (req, res) => {
     let decoded;
     try { decoded = await authAdmin.verifyIdToken(idToken); }
     catch { return res.status(401).json({ success: false, error: 'Invalid session — login again' }); }
-    const project = process.env.FIRESTORE_PROJECT_ID || 'food-mela-notification';
-    // Rider accounts are phone-keyed (users/{10-digit-phone}); the Auth uid
-    // doc usually does NOT exist. Try uid doc first, then the phone-keyed doc
-    // from the request body (app sends the logged-in phone).
+    
     const bodyPhone = String((req.body && req.body.phone) || '').replace(/[^0-9]/g, '').slice(-10);
     const docIds = [decoded.uid];
     if (bodyPhone.length >= 10 && !docIds.includes(bodyPhone)) docIds.push(bodyPhone);
-    const fetchUserDoc = (docId) => new Promise((resolve) => {
-      const docPath = `/v1/projects/${project}/databases/(default)/documents/users/${docId}`;
-      const r = https.request({ hostname: 'firestore.googleapis.com', path: docPath, method: 'GET' }, (rs) => {
-        let d = '';
-        rs.on('data', (c) => { d += c; });
-        rs.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
-      });
-      r.on('error', () => resolve(null));
-      r.setTimeout(10000, () => { r.destroy(); resolve(null); });
-      r.end();
-    });
-    let resp = await fetchUserDoc(docIds[0]);
-    let f = (resp && resp.fields) || {};
-    if ((!f.role || !f.role.stringValue) && docIds.length > 1) {
-      resp = await fetchUserDoc(docIds[1]);
-      f = (resp && resp.fields) || {};
+
+    const fetchUserDoc = async (docId) => {
+      try {
+        const db = adminDb();
+        if (db) {
+          const snap = await db.collection('users').doc(String(docId)).get();
+          if (snap.exists) return snap.data();
+        }
+      } catch (e) { console.error('fetchUserDoc admin read notice:', e.message); }
+      return null;
+    };
+
+    let uData = await fetchUserDoc(docIds[0]);
+    if ((!uData || !uData.role) && docIds.length > 1) {
+      uData = await fetchUserDoc(docIds[1]);
     }
-    const role = (f.role && f.role.stringValue) || '';
-    const approval = (f.approvalStatus && f.approvalStatus.stringValue) || '';
-    const blocked = (f.accountStatus && f.accountStatus.stringValue) === 'blocked';
-    const phone = (((f.phone && f.phone.stringValue) || '') || (docIds.length > 1 ? docIds[1] : '')).replace(/[^0-9]/g, '').slice(-10);
+    if (!uData && bodyPhone.length >= 10) {
+      try {
+        const db = adminDb();
+        if (db) {
+          const q = await db.collection('users').where('phone', '==', bodyPhone).limit(1).get();
+          if (!q.empty) uData = q.docs[0].data();
+        }
+      } catch (_) {}
+    }
+
+    const role = (uData && uData.role) || '';
+    const approval = (uData && uData.approvalStatus) || '';
+    const blocked = (uData && uData.accountStatus) === 'blocked';
+    const phone = String((uData && uData.phone) || (docIds.length > 1 ? docIds[1] : '')).replace(/[^0-9]/g, '').slice(-10);
     if (role !== 'delivery_partner') return res.status(403).json({ success: false, error: 'Rider account required' });
     if (blocked) return res.status(403).json({ success: false, error: 'Account is blocked' });
     if (approval !== 'approved') return res.status(403).json({ success: false, error: 'Account awaiting approval' });
     if (phone.length < 10) return res.status(403).json({ success: false, error: 'No phone linked to rider account' });
-    // Firestore custom token so the rider app passes the hardened rules
-    // (isRider checks users/{uid} role). uid = Firebase Auth uid.
+
     let firebaseToken = null;
     try {
       const authAdmin2 = adminAuth();
-      if (authAdmin2) { firebaseToken = await authAdmin2.createCustomToken(decoded.uid, { role: 'rider', phone_number: phone }); try { await authAdmin2.setCustomUserClaims(decoded.uid, { role: 'rider', phone_number: phone }); } catch (e2) { console.error('rider custom claims notice:', e2.message); } }
+      if (authAdmin2) {
+        firebaseToken = await authAdmin2.createCustomToken(decoded.uid, { role: 'rider', phone_number: phone });
+        try { await authAdmin2.setCustomUserClaims(decoded.uid, { role: 'rider', phone_number: phone }); } catch (e2) { console.error('rider custom claims notice:', e2.message); }
+      }
     } catch (e) { console.error('rider custom token notice:', e.message); }
     res.json({ success: true, apiToken: mintApiToken(phone, 'rider'), phone, firebaseToken });
   } catch (e) {

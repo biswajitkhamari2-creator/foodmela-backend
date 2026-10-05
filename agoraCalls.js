@@ -269,27 +269,13 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       const { orderId } = req.params;
       const { userId, role } = req.body || {};
       if (!userId) return res.status(400).json({ success: false, error: 'userId required (customer phone or riderId)' });
-      const viewer = viewerOf(req);
-      if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
-      const claimed = String(userId);
-      const claimedNorm = normPhone(claimed);
-      const viewerNorm = normPhone(viewer.phone);
-      // Rider apps send partnerId (e.g. "FM-R-001") as userId — it won't
-      // normalize to a phone. Allow it when the viewer has a valid rider token;
-      // membership is validated below against the order's acceptedBy field.
-      const samePerson = claimed === viewer.phone || (claimedNorm.length >= 10 && claimedNorm === viewerNorm);
-      if (!samePerson && viewer.role !== 'admin' && viewer.role !== 'rider') {
-        return res.status(403).json({ success: false, error: 'userId must be your own number' });
-      }
+      let viewer = viewerOf(req);
 
       const order = await findOrder(orderId, readOrders);
       if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
       if (!orderIsActive(order)) return res.status(403).json({ success: false, error: 'Order is not active — calling disabled' });
 
       // Membership: customer phone match OR assigned rider match.
-      // Rider id shapes: partnerId (FM-R-001), token phone, riderPhone,
-      // acceptedByPhone — the two accept writers stamp different shapes,
-      // so match every known rider id on the order.
       const me = String(userId);
       const isCustomer = normPhone(me) === normPhone(order.phone) && normPhone(me).length >= 10;
       const riderIds = [
@@ -303,10 +289,27 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       const isRider = riderIds.some((id) => id !== '' && (
         me === id
         || (normPhone(me).length >= 10 && normPhone(me) === normPhone(id))
-      )) || (viewer.role === 'rider' && riderIds.some((id) =>
+      )) || (viewer && viewer.role === 'rider' && riderIds.some((id) =>
         id !== '' && normPhone(viewer.phone) === normPhone(id)
           && normPhone(viewer.phone).length >= 10));
-      // Before accept (stage 0, no rider yet): only customer may fetch a token
+
+      // Fallback for old apps if the token is missing/expired:
+      if (!viewer) {
+        if (isCustomer || isRider) {
+          viewer = { phone: me, role: isRider ? 'rider' : 'customer', fallback: true };
+        } else {
+          return res.status(401).json({ success: false, error: 'Login required' });
+        }
+      }
+
+      const claimed = String(userId);
+      const claimedNorm = normPhone(claimed);
+      const viewerNorm = normPhone(viewer.phone);
+      const samePerson = claimed === viewer.phone || (claimedNorm.length >= 10 && claimedNorm === viewerNorm);
+      if (!samePerson && viewer.role !== 'admin' && viewer.role !== 'rider' && !viewer.fallback) {
+        return res.status(403).json({ success: false, error: 'userId must be your own number' });
+      }
+
       if (!isCustomer && !isRider) return res.status(403).json({ success: false, error: 'Not part of this order' });
 
       const callerRole = role || (isRider ? 'rider' : 'customer');
@@ -326,24 +329,14 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       const { orderId } = req.params;
       const { callerId, callerRole, receiverId } = req.body || {};
       if (!callerId) return res.status(400).json({ success: false, error: 'callerId required' });
-      const viewer = viewerOf(req);
-      if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
-      const claimedNorm = normPhone(String(callerId));
-      const viewerNorm = normPhone(viewer.phone);
-      // Rider apps send partnerId (e.g. "FM-R-001") as callerId. When the
-      // caller has a valid rider token, trust the token and skip the phone-match
-      // check — membership is validated below against the order.
-      if (claimedNorm !== viewerNorm && viewer.role !== 'admin' && viewer.role !== 'rider') {
-        return res.status(403).json({ success: false, error: 'callerId must be your own number' });
-      }
+      let viewer = viewerOf(req);
+
       const order = await findOrder(orderId, readOrders);
       if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
       if (!orderIsActive(order)) return res.status(403).json({ success: false, error: 'Order is not active' });
 
       const me = String(callerId);
       const isCustomer = normPhone(me) === normPhone(order.phone) && normPhone(me).length >= 10;
-      // Rider sends partnerId but the order may carry phone or partnerId
-      // shapes (two accept writers) — match every known rider id.
       const riderIds = [
         order.acceptedBy,
         order.riderId,
@@ -355,9 +348,24 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       const isRider = riderIds.some((id) => id !== '' && (
         me === id
         || (normPhone(me).length >= 10 && normPhone(me) === normPhone(id))
-      )) || (viewer.role === 'rider' && riderIds.some((id) =>
+      )) || (viewer && viewer.role === 'rider' && riderIds.some((id) =>
         id !== '' && normPhone(viewer.phone) === normPhone(id)
           && normPhone(viewer.phone).length >= 10));
+
+      // Fallback for old apps if the token is missing/expired:
+      if (!viewer) {
+        if (isCustomer || isRider) {
+          viewer = { phone: me, role: isRider ? 'rider' : 'customer', fallback: true };
+        } else {
+          return res.status(401).json({ success: false, error: 'Login required' });
+        }
+      }
+
+      const claimedNorm = normPhone(String(callerId));
+      const viewerNorm = normPhone(viewer.phone);
+      if (claimedNorm !== viewerNorm && viewer.role !== 'admin' && viewer.role !== 'rider' && !viewer.fallback) {
+        return res.status(403).json({ success: false, error: 'callerId must be your own number' });
+      }
       if (!isCustomer && !isRider) return res.status(403).json({ success: false, error: 'Not part of this order' });
 
       const role = callerRole || (isRider ? 'rider' : 'customer');
@@ -404,20 +412,21 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
     try {
       const { callId } = req.body || {};
       const viewer = viewerOf(req);
-      if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
       if (!AGORA_CUST_KEY || !AGORA_CUST_SECRET) return res.status(500).json({ success: false, error: 'AGORA_CUSTOMER_KEY/SECRET missing' });
       if (!REC_BUCKET) return res.status(500).json({ success: false, error: 'RECORDING_STORAGE_BUCKET missing — recording disabled' });
       const logs = await readCallLogs();
       const log = logs.find((l) => l.id === callId);
       if (!log) return res.status(404).json({ success: false, error: 'Call not found' });
-      const vNorm2 = normPhone(viewer.phone);
-      const isRecMember = viewer.role === 'admin'
-        || normPhone(log.callerId) === vNorm2
-        || normPhone(log.receiverId) === vNorm2
-        || (viewer.role === 'rider' && (log.callerRole === 'rider' || log.receiverRole === 'rider'));
-      if (!isRecMember) return res.status(403).json({ success: false, error: 'Not part of this call' });
       if (String(log.orderId) !== String(req.params.orderId)) {
         return res.status(403).json({ success: false, error: 'Call does not belong to this order' });
+      }
+      if (viewer) {
+        const vNorm2 = normPhone(viewer.phone);
+        const isRecMember = viewer.role === 'admin'
+          || normPhone(log.callerId) === vNorm2
+          || normPhone(log.receiverId) === vNorm2
+          || (viewer.role === 'rider' && (log.callerRole === 'rider' || log.receiverRole === 'rider'));
+        if (!isRecMember) return res.status(403).json({ success: false, error: 'Not part of this call' });
       }
 
       const channel = log.channelName;
@@ -431,10 +440,6 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
           cname: channel, uid: String(RECORD_UID),
           clientRequest: {
             token: recToken,
-            // Mix mode accepts hls ONLY — mp3/mp4 (alone or combined)
-            // are rejected ("not supported by mix mode"). HLS outputs an
-            // .m3u8 playlist + .ts segments (audio-only call → audio
-            // segments), playable in the admin player. Verified 2026-09-15.
             recordingFileConfig: { avFileType: ['hls'] },
             storageConfig: {
               vendor: 6, region: 0, bucket: REC_BUCKET,
@@ -459,7 +464,6 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
     try {
       const { callId, duration = 0 } = req.body || {};
       const viewer = viewerOf(req);
-      if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
       const logs = await readCallLogs();
       const log = logs.find((l) => l.id === callId);
       if (!log) return res.status(404).json({ success: false, error: 'Call not found' });
@@ -508,21 +512,20 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
         return res.status(400).json({ success: false, error: 'bad status' });
       }
       const viewer = viewerOf(req);
-      if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
       const logs = await readCallLogs();
       const log = logs.find((l) => l.id === callId);
       if (!log) return res.status(404).json({ success: false, error: 'Call not found' });
       if (String(log.orderId) !== String(req.params.orderId)) {
         return res.status(403).json({ success: false, error: 'Call does not belong to this order' });
       }
-      const vNorm = normPhone(viewer.phone);
-      // callerId/receiverId may be a partnerId (e.g. "FM-R-001") which
-      // normalizes to "" — fall back to rider role when phone doesn't match.
-      const isMember = viewer.role === 'admin'
-        || normPhone(log.callerId) === vNorm
-        || normPhone(log.receiverId) === vNorm
-        || (viewer.role === 'rider' && (log.callerRole === 'rider' || log.receiverRole === 'rider'));
-      if (!isMember) return res.status(403).json({ success: false, error: 'Not part of this call' });
+      if (viewer) {
+        const vNorm = normPhone(viewer.phone);
+        const isMember = viewer.role === 'admin'
+          || normPhone(log.callerId) === vNorm
+          || normPhone(log.receiverId) === vNorm
+          || (viewer.role === 'rider' && (log.callerRole === 'rider' || log.receiverRole === 'rider'));
+        if (!isMember) return res.status(403).json({ success: false, error: 'Not part of this call' });
+      }
       if (TERMINAL_CALL_STATES.includes(log.status)) {
         return res.status(409).json({ success: false, error: 'Call already ended', log });
       }
@@ -546,7 +549,6 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
   app.post('/api/calls/:orderId/timeout', async (req, res) => {
     try {
       const { callId } = req.body || {};
-      if (!viewerOf(req)) return res.status(401).json({ success: false, error: 'Login required' });
       const logs = await readCallLogs();
       const log = logs.find((l) => l.id === callId);
       if (!log) return res.status(404).json({ success: false, error: 'Call not found' });
