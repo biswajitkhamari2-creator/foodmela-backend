@@ -706,11 +706,12 @@ function sendFcmToToken(token, title, body, data) {
   });
 }
 
-// ── POST /api/calls/:orderId/request { callerId, callerRole } ──────────
-// Call access gate: ONLY the order's customer ↔ assigned rider, ONLY while
-// the order is active (stage 0-2). Delivered (3+) / cancelled → 403.
+// ── DEPRECATED (E1 fix): legacy POST /api/calls/:orderId/request ──────────
+// Disabled: this handler shadowed the canonical agoraCalls.js:327 route and
+// never wrote fm_call_logs_v1, so every accept got 404 "Call not found".
+// Canonical handler now serves /api/calls/:orderId/request. Kept for reference.
 // Rider→rider calls are impossible by design (no shared order, not a member).
-app.post('/api/calls/:orderId/request', maintenanceGate, async (req, res) => {
+app.post('/api/calls-legacy-disabled/:orderId/request', maintenanceGate, async (req, res) => {
   try {
     const { orderId } = req.params;
     const { callerId, callerRole, receiverId } = req.body || {};

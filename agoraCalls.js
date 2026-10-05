@@ -16,10 +16,13 @@ try {
   console.warn('⚠️ agora-access-token not installed — /api/calls token endpoints will 501 until `npm i agora-access-token`');
 }
 
-const AGORA_APP_ID = process.env.AGORA_APP_ID || 'ca957bd9daa74c6199bbe2178d8c6b3c';
-const AGORA_APP_CERT = process.env.AGORA_APP_CERTIFICATE || '5e867d35caf54e0782da52169cb1bd81';
-const AGORA_CUST_KEY = process.env.AGORA_CUSTOMER_KEY || 'b754645cc0ea4d32b969842226e8b6d2';
-const AGORA_CUST_SECRET = process.env.AGORA_CUSTOMER_SECRET || 'fdec008d143e48d5b46962fea1a21ede';
+// E3 fix: env-only — no live secrets in git. Missing values fail cleanly
+// (500 with a clear message) via the guards on /token and /record/start.
+// Set real values in .env (local) + Vercel env (production).
+const AGORA_APP_ID = process.env.AGORA_APP_ID || '';
+const AGORA_APP_CERT = process.env.AGORA_APP_CERTIFICATE || '';
+const AGORA_CUST_KEY = process.env.AGORA_CUSTOMER_KEY || '';
+const AGORA_CUST_SECRET = process.env.AGORA_CUSTOMER_SECRET || '';
 // ── Recording storage: Firebase Storage (= Google Cloud Storage bucket) ─────
 // Agora vendor 6 = GCS, region 0. Keys are GCS *HMAC interoperability* keys
 // (Cloud Console → Cloud Storage → Settings → Interoperability), NOT Firebase
@@ -293,20 +296,17 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
         id !== '' && normPhone(viewer.phone) === normPhone(id)
           && normPhone(viewer.phone).length >= 10));
 
-      // Fallback for old apps if the token is missing/expired:
+      // E4 fix: valid session token required — no unauthenticated fallback.
+      // Old apps with expired tokens must re-login (client shows "session expired").
       if (!viewer) {
-        if (isCustomer || isRider) {
-          viewer = { phone: me, role: isRider ? 'rider' : 'customer', fallback: true };
-        } else {
-          return res.status(401).json({ success: false, error: 'Login required' });
-        }
+        return res.status(401).json({ success: false, error: 'Login required' });
       }
 
       const claimed = String(userId);
       const claimedNorm = normPhone(claimed);
       const viewerNorm = normPhone(viewer.phone);
       const samePerson = claimed === viewer.phone || (claimedNorm.length >= 10 && claimedNorm === viewerNorm);
-      if (!samePerson && viewer.role !== 'admin' && viewer.role !== 'rider' && !viewer.fallback) {
+      if (!samePerson && viewer.role !== 'admin' && viewer.role !== 'rider') {
         return res.status(403).json({ success: false, error: 'userId must be your own number' });
       }
 
@@ -352,18 +352,14 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
         id !== '' && normPhone(viewer.phone) === normPhone(id)
           && normPhone(viewer.phone).length >= 10));
 
-      // Fallback for old apps if the token is missing/expired:
+      // E4 fix: valid session token required — no unauthenticated fallback.
       if (!viewer) {
-        if (isCustomer || isRider) {
-          viewer = { phone: me, role: isRider ? 'rider' : 'customer', fallback: true };
-        } else {
-          return res.status(401).json({ success: false, error: 'Login required' });
-        }
+        return res.status(401).json({ success: false, error: 'Login required' });
       }
 
       const claimedNorm = normPhone(String(callerId));
       const viewerNorm = normPhone(viewer.phone);
-      if (claimedNorm !== viewerNorm && viewer.role !== 'admin' && viewer.role !== 'rider' && !viewer.fallback) {
+      if (claimedNorm !== viewerNorm && viewer.role !== 'admin' && viewer.role !== 'rider') {
         return res.status(403).json({ success: false, error: 'callerId must be your own number' });
       }
       if (!isCustomer && !isRider) return res.status(403).json({ success: false, error: 'Not part of this order' });
