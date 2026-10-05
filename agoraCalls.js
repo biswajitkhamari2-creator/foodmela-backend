@@ -16,10 +16,10 @@ try {
   console.warn('⚠️ agora-access-token not installed — /api/calls token endpoints will 501 until `npm i agora-access-token`');
 }
 
-const AGORA_APP_ID = process.env.AGORA_APP_ID || '';
-const AGORA_APP_CERT = process.env.AGORA_APP_CERTIFICATE || '';
-const AGORA_CUST_KEY = process.env.AGORA_CUSTOMER_KEY || '';
-const AGORA_CUST_SECRET = process.env.AGORA_CUSTOMER_SECRET || '';
+const AGORA_APP_ID = process.env.AGORA_APP_ID || 'ca957bd9daa74c6199bbe2178d8c6b3c';
+const AGORA_APP_CERT = process.env.AGORA_APP_CERTIFICATE || '5e867d35caf54e0782da52169cb1bd81';
+const AGORA_CUST_KEY = process.env.AGORA_CUSTOMER_KEY || 'b754645cc0ea4d32b969842226e8b6d2';
+const AGORA_CUST_SECRET = process.env.AGORA_CUSTOMER_SECRET || 'fdec008d143e48d5b46962fea1a21ede';
 // ── Recording storage: Firebase Storage (= Google Cloud Storage bucket) ─────
 // Agora vendor 6 = GCS, region 0. Keys are GCS *HMAC interoperability* keys
 // (Cloud Console → Cloud Storage → Settings → Interoperability), NOT Firebase
@@ -154,15 +154,19 @@ function normalizeOrderDoc(orderId, d) {
   };
   return {
     id: str('orderId') || orderId,
-    phone: str('customerPhone'),
+    phone: str('customerPhone') || str('phone') || str('userPhone'),
+    customerPhone: str('customerPhone') || str('phone') || str('userPhone'),
     // The rider app accepts via the Firestore fast-path with
     // riderId=<partnerId> (e.g. FM-R-001); the backend accept stamps
     // riderId=<token phone>. Read every id shape so membership checks
     // work no matter which writer claimed the order.
-    acceptedBy: str('riderId') || str('acceptedBy') || str('riderPartnerId') || null,
-    riderPartnerId: str('riderPartnerId') || null,
+    acceptedBy: str('riderId') || str('acceptedBy') || str('riderPartnerId') || str('partnerId') || null,
+    riderId: str('riderId') || str('partnerId') || null,
+    riderPartnerId: str('riderPartnerId') || str('partnerId') || null,
+    partnerId: str('partnerId') || str('riderPartnerId') || null,
     riderPhone: str('riderPhone') || str('acceptedByPhone') || null,
-    acceptedByName: str('riderName') || null,
+    acceptedByPhone: str('acceptedByPhone') || str('riderPhone') || null,
+    acceptedByName: str('riderName') || str('driverName') || str('acceptedByName') || null,
     stage: num('stage'),
     status: str('status'),
   };
@@ -175,6 +179,8 @@ async function fetchOrderFromFirestore(orderId) {
     if (db) {
       const snap = await db.collection('orders').doc(String(orderId)).get();
       if (snap.exists) return normalizeOrderDoc(orderId, snap.data());
+      const q = await db.collection('orders').where('orderId', '==', String(orderId)).limit(1).get();
+      if (!q.empty) return normalizeOrderDoc(orderId, q.docs[0].data());
       return null;
     }
   } catch (e) {
@@ -195,9 +201,9 @@ async function fetchOrderFromFirestore(orderId) {
           const num = (k) => (f[k] && f[k].integerValue !== undefined ? Number(f[k].integerValue) : 0);
           if (!doc.fields) return resolve(null);
           resolve(normalizeOrderDoc(orderId, {
-            orderId: str('orderId'), customerPhone: str('customerPhone'),
-            riderId: str('riderId'), acceptedBy: str('acceptedBy'),
-            riderPartnerId: str('riderPartnerId'), riderPhone: str('riderPhone'),
+            orderId: str('orderId'), customerPhone: str('customerPhone') || str('phone'),
+            riderId: str('riderId') || str('partnerId'), acceptedBy: str('acceptedBy'),
+            riderPartnerId: str('riderPartnerId') || str('partnerId'), riderPhone: str('riderPhone'),
             acceptedByPhone: str('acceptedByPhone'), riderName: str('riderName'),
             stage: num('stage'), status: str('status'),
           }));
@@ -286,8 +292,14 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       // so match every known rider id on the order.
       const me = String(userId);
       const isCustomer = normPhone(me) === normPhone(order.phone) && normPhone(me).length >= 10;
-      const riderIds = [order.acceptedBy, order.riderPartnerId, order.riderPhone]
-        .map((v) => String(v || ''));
+      const riderIds = [
+        order.acceptedBy,
+        order.riderId,
+        order.riderPhone,
+        order.acceptedByPhone,
+        order.riderPartnerId,
+        order.partnerId,
+      ].map((v) => String(v || ''));
       const isRider = riderIds.some((id) => id !== '' && (
         me === id
         || (normPhone(me).length >= 10 && normPhone(me) === normPhone(id))
@@ -332,8 +344,14 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       const isCustomer = normPhone(me) === normPhone(order.phone) && normPhone(me).length >= 10;
       // Rider sends partnerId but the order may carry phone or partnerId
       // shapes (two accept writers) — match every known rider id.
-      const riderIds = [order.acceptedBy, order.riderPartnerId, order.riderPhone]
-        .map((v) => String(v || ''));
+      const riderIds = [
+        order.acceptedBy,
+        order.riderId,
+        order.riderPhone,
+        order.acceptedByPhone,
+        order.riderPartnerId,
+        order.partnerId,
+      ].map((v) => String(v || ''));
       const isRider = riderIds.some((id) => id !== '' && (
         me === id
         || (normPhone(me).length >= 10 && normPhone(me) === normPhone(id))
@@ -348,8 +366,8 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       // app listens with its partnerId (listenMyId), but order.acceptedBy may
       // be the token phone after the backend accept mirror — prefer the
       // partnerId shape when known so the Firestore invite reaches the rider.
-      const riderListenId = order.riderPartnerId || order.acceptedBy || '';
-      const otherId = receiverId || (role === 'customer' ? riderListenId : (order.phone || ''));
+      const riderListenId = order.riderPartnerId || order.riderId || order.partnerId || order.riderPhone || order.acceptedBy || '';
+      const otherId = receiverId || (role === 'customer' ? riderListenId : (order.phone || order.customerPhone || ''));
       if (!otherId) return res.status(409).json({ success: false, error: 'No rider assigned yet — cannot call' });
 
       const logs = await readCallLogs();

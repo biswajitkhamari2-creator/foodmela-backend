@@ -205,6 +205,28 @@ app.use('/api/', async (req, res, next) => {
 
 const ORDERS_KEY    = 'fm_orders_v1';
 const ORDER_SEQ_KEY = 'fm_order_seq';
+// ─── ORDER IDEMPOTENCY LOCKS ────────────────────────────────────────────────
+// Redis SET NX (atomic): first concurrent request wins, the loser waits and
+// re-reads — so double-taps / double PayU callbacks can NEVER create 2 rows.
+// Lock auto-expires in 60s (crash-safe); always released in finally.
+const ORDER_LOCK_PREFIX = 'fm_order_lock:';
+async function acquireOrderLock(key, ttlSec = 60) {
+  try {
+    const r = await upstashCommand(['SET', ORDER_LOCK_PREFIX + key, '1', 'EX', String(ttlSec), 'NX']);
+    return r && r.result === 'OK';
+  } catch (_) { return true; /* fail-open: Redis down → old behavior */ }
+}
+async function releaseOrderLock(key) {
+  try { await upstashCommand(['DEL', ORDER_LOCK_PREFIX + key]); } catch (_) {}
+}
+const _memLocks = new Map();
+function acquireMemLock(key) {
+  if (_memLocks.has(key)) return false;
+  _memLocks.set(key, Date.now());
+  return true;
+}
+function releaseMemLock(key) { _memLocks.delete(key); }
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 // ─── CENTRAL ORDER NUMBER ─────────────────────────────────────────────────
 // Backend-owned sequence via Redis INCR (atomic, concurrency-safe).
 // Format: FM-YYYYMMDD-NNNNNN (e.g. FM-20260927-000001). The client-supplied
@@ -691,7 +713,7 @@ function sendFcmToToken(token, title, body, data) {
 app.post('/api/calls/:orderId/request', maintenanceGate, async (req, res) => {
   try {
     const { orderId } = req.params;
-    const { callerId, callerRole } = req.body || {};
+    const { callerId, callerRole, receiverId } = req.body || {};
     if (!['customer', 'rider'].includes(String(callerRole))) {
       return res.status(400).json({ success: false, error: 'callerRole must be customer or rider' });
     }
@@ -700,13 +722,17 @@ app.post('/api/calls/:orderId/request', maintenanceGate, async (req, res) => {
     let order = null;
     try {
       const orders = await readOrders();
-      order = orders.find(o => o.id === orderId || o.orderId === orderId) || null;
+      order = orders.find(o => o.id === orderId || o.orderId === orderId || (orderId && o.id && o.id.replace(/^FM-?/i, '') === String(orderId).replace(/^FM-?/i, ''))) || null;
     } catch (_) {}
     if (!order) {
       try {
         const db = adminDb();
         if (db) {
-          const snap = await db.collection('orders').doc(String(orderId)).get();
+          let snap = await db.collection('orders').doc(String(orderId)).get();
+          if (!snap.exists) {
+            const q = await db.collection('orders').where('orderId', '==', String(orderId)).limit(1).get();
+            if (!q.empty) snap = q.docs[0];
+          }
           if (snap.exists) order = { id: orderId, ...snap.data() };
         }
       } catch (e) { console.error('call-request fs lookup notice:', e.message); }
@@ -720,19 +746,29 @@ app.post('/api/calls/:orderId/request', maintenanceGate, async (req, res) => {
     }
     // Membership: customer phone or assigned rider only.
     const orderPhone = String(order.phone || order.customerPhone || '').replace(/[^0-9]/g, '').slice(-10);
-    const riderIds = [order.acceptedBy, order.riderId, order.riderPhone,
-      order.acceptedByPhone, order.riderPartnerId].map((v) => String(v || ''));
-    const riderMatch = viewer.role === 'rider' && riderIds.some((id) =>
-      id !== '' && (id === viewer.phone
-        || (id.replace(/[^0-9]/g, '').slice(-10) === viewer.phone
-          && viewer.phone.replace(/[^0-9]/g, '').length >= 10)));
+    const riderIds = [
+      order.acceptedBy,
+      order.riderId,
+      order.riderPhone,
+      order.acceptedByPhone,
+      order.riderPartnerId,
+      order.partnerId,
+    ].map((v) => String(v || ''));
+    const callerIdStr = String(callerId || '');
+    const riderMatch = (viewer.role === 'rider' || callerRole === 'rider') && riderIds.some((id) =>
+      id !== '' && (
+        id === viewer.phone
+        || id === callerIdStr
+        || (id.replace(/[^0-9]/g, '').slice(-10) === viewer.phone && viewer.phone.replace(/[^0-9]/g, '').length >= 10)
+        || (id.replace(/[^0-9]/g, '').slice(-10) === callerIdStr.replace(/[^0-9]/g, '').slice(-10) && callerIdStr.replace(/[^0-9]/g, '').length >= 10)
+      ));
     const isMember = viewer.role === 'admin'
-      || viewer.phone === orderPhone
+      || (viewer.phone && viewer.phone === orderPhone)
       || riderMatch;
     if (!isMember) return res.status(403).json({ success: false, error: 'Not part of this order' });
     // Role must match the caller's real side (customer can't pose as rider).
     if (viewer.role !== 'admin') {
-      if (String(callerRole) === 'customer' && viewer.phone !== orderPhone) {
+      if (String(callerRole) === 'customer' && viewer.phone && viewer.phone !== orderPhone) {
         return res.status(403).json({ success: false, error: 'Not part of this order' });
       }
       if (String(callerRole) === 'rider' && !riderMatch) {
@@ -740,8 +776,25 @@ app.post('/api/calls/:orderId/request', maintenanceGate, async (req, res) => {
       }
     }
     const callId = `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    console.log(`📞 CALL REQUEST ${callId} on ${orderId} by ${callerRole} ${String(callerId || '').slice(-4)}`);
-    res.json({ success: true, callId, channelName: `order_${orderId}`, log: { receiverRole: callerRole === 'customer' ? 'rider' : 'customer' } });
+    const riderTargetId = order.riderPartnerId || order.riderId || order.partnerId || order.riderPhone || order.acceptedBy || '';
+    const customerTargetId = orderPhone || String(order.phone || order.customerPhone || '');
+    const resolvedReceiverId = receiverId || (callerRole === 'customer' ? riderTargetId : customerTargetId);
+    console.log(`📞 CALL REQUEST ${callId} on ${orderId} by ${callerRole} ${String(callerId || '').slice(-4)} -> receiver: ${resolvedReceiverId}`);
+    res.json({
+      success: true,
+      callId,
+      channelName: `order_${orderId}`,
+      log: {
+        id: callId,
+        orderId,
+        callerId: callerIdStr,
+        callerRole,
+        receiverId: resolvedReceiverId,
+        receiverRole: callerRole === 'customer' ? 'rider' : 'customer',
+        status: 'ringing',
+        channelName: `order_${orderId}`,
+      }
+    });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -775,14 +828,18 @@ app.post('/api/calls/:orderId/ring', async (req, res) => {
     let order = null;
     try {
       const orders = await readOrders();
-      order = orders.find(o => o.id === orderId || o.orderId === orderId) || null;
+      order = orders.find(o => o.id === orderId || o.orderId === orderId || (orderId && o.id && o.id.replace(/^FM-?/i, '') === String(orderId).replace(/^FM-?/i, ''))) || null;
     } catch (_) {}
     let fsData = null;
     if (!order) {
       try {
         const db = adminDb();
         if (db) {
-          const snap = await db.collection('orders').doc(String(orderId)).get();
+          let snap = await db.collection('orders').doc(String(orderId)).get();
+          if (!snap.exists) {
+            const q = await db.collection('orders').where('orderId', '==', String(orderId)).limit(1).get();
+            if (!q.empty) snap = q.docs[0];
+          }
           if (snap.exists) {
             fsData = snap.data() || {};
             order = { id: orderId, ...fsData };
@@ -796,14 +853,20 @@ app.post('/api/calls/:orderId/ring', async (req, res) => {
     // riderPhone, acceptedByPhone, riderPartnerId). A rider is a member only
     // when their verified token phone matches one of them — never any rider
     // on any order (that allowed call-push spam on unassigned orders).
-    const riderIds = [order.acceptedBy, order.riderId, order.riderPhone,
-      order.acceptedByPhone, order.riderPartnerId].map((v) => String(v || ''));
-    const riderMatch = viewer.role === 'rider' && riderIds.some((id) =>
+    const riderIds = [
+      order.acceptedBy,
+      order.riderId,
+      order.riderPhone,
+      order.acceptedByPhone,
+      order.riderPartnerId,
+      order.partnerId,
+    ].map((v) => String(v || ''));
+    const riderMatch = (viewer.role === 'rider' || callerRole === 'rider') && riderIds.some((id) =>
       id !== '' && (id === viewer.phone
         || (id.replace(/[^0-9]/g, '').slice(-10) === viewer.phone
           && viewer.phone.replace(/[^0-9]/g, '').length >= 10)));
     const isMember = viewer.role === 'admin'
-      || viewer.phone === orderPhone
+      || (viewer.phone && viewer.phone === orderPhone)
       || riderMatch;
     if (!isMember) return res.status(403).json({ success: false, error: 'Not part of this order' });
     const otherRole = callerRole === 'customer' ? 'rider' : 'customer';
@@ -1120,6 +1183,13 @@ function mirrorOrderToFirestore(o) {
       riderId: o.acceptedBy ?? null,
       riderName: o.acceptedByName ?? null,
       deliveryOtp: String(o.deliveryOtp || ''),
+      // Payment fields mirrored so admin panel + apps show PREPAID/COD
+      // instantly on every write (place, callback, COD→PREPAID switch).
+      paymentMode: o.paymentMode || (String(o.address || '').toUpperCase().includes('PREPAID') ? 'PREPAID' : 'COD'),
+      paymentStatus: o.paymentStatus || (String(o.address || '').toUpperCase().includes('PREPAID') ? 'PAID' : 'PENDING'),
+      paymentGateway: o.paymentGateway || null,
+      gatewayTxnId: o.gatewayTxnId || null,
+      isConvertedFromCOD: o.isConvertedFromCOD === true,
       createdAt: new Date(o.placedAt || o.timestamp || Date.now()),
       updatedAt: new Date(),
       isDeleted: false,
@@ -1254,7 +1324,7 @@ app.post('/api/auth/rider/token', maintenanceGate, async (req, res) => {
     let firebaseToken = null;
     try {
       const authAdmin2 = adminAuth();
-      if (authAdmin2) firebaseToken = await authAdmin2.createCustomToken(decoded.uid, { role: 'rider', phone_number: phone });
+      if (authAdmin2) { firebaseToken = await authAdmin2.createCustomToken(decoded.uid, { role: 'rider', phone_number: phone }); try { await authAdmin2.setCustomUserClaims(decoded.uid, { role: 'rider', phone_number: phone }); } catch (e2) { console.error('rider custom claims notice:', e2.message); } }
     } catch (e) { console.error('rider custom token notice:', e.message); }
     res.json({ success: true, apiToken: mintApiToken(phone, 'rider'), phone, firebaseToken });
   } catch (e) {
@@ -1530,7 +1600,7 @@ app.post('/api/auth/refresh', async (req, res) => {
     let decoded;
     try { decoded = await authAdmin.verifyIdToken(idToken); }
     catch { return res.status(401).json({ success: false, error: 'Invalid session — login again' }); }
-    const phone = String(decoded.uid || '').replace(/[^0-9]/g, '').slice(-10);
+    const phone = String(decoded.phone_number || decoded.phoneNumber || req.body?.phone || decoded.uid || '').replace(/[^0-9]/g, '').slice(-10);
     if (phone.length < 10) return res.status(401).json({ success: false, error: 'Invalid session — login again' });
     return res.json({ success: true, phone, apiToken: mintApiToken(phone, 'customer') });
   } catch (e) {
@@ -1978,6 +2048,28 @@ const placeOrderHandler = async (req, res) => {
     // order number is ALWAYS backend-generated via nextOrderNumber().
     const clientRef = String(req.body.id || req.body.orderId || req.body.clientRef || '').trim();
 
+    // ── Distributed lock: concurrent double-taps / retries with the same
+    // key serialize here. Loser waits, re-reads, and gets `duplicate: true`.
+    const lockKey = clientRef ? `place:${clientRef}` : `place:${orderPhone}:${amountNum}:${String(items || '').slice(0, 40)}`;
+    let haveLock = acquireMemLock(lockKey);
+    if (!haveLock) {
+      // Another request with the same key is already creating the order —
+      // wait for it, then return the order it created (never a 2nd row).
+      for (let i = 0; i < 20 && !haveLock; i++) {
+        await sleep(250);
+        haveLock = acquireMemLock(lockKey);
+        if (haveLock) break;
+        try {
+          const retryOrders = await readOrders();
+          const done = retryOrders.find(o =>
+            (clientRef && (o.clientRef === clientRef || o.id === clientRef || o.orderId === clientRef)) ||
+            (!clientRef && o.phone === orderPhone && Number(o.amountValue) === amountNum && String(o.items || '') === String(items || '')));
+          if (done) return res.json({ success: true, order: done, duplicate: true });
+        } catch (_) {}
+      }
+    }
+    const haveRedisLock = haveLock ? await acquireOrderLock(lockKey) : false;
+    try {
     const orders = await readOrders();
 
     // Idempotency: retry with the same clientRef returns the original order.
@@ -1985,6 +2077,21 @@ const placeOrderHandler = async (req, res) => {
       const prior = orders.find(o => o.clientRef === clientRef || o.id === clientRef || o.orderId === clientRef);
       if (prior) {
         return res.json({ success: true, order: prior, duplicate: true });
+      }
+    }
+    // No clientRef (old apps): same phone + same items + same amount within
+    // 90 seconds = accidental double-tap, NOT a new order.
+    if (!clientRef) {
+      const nowMs = Date.now();
+      const recent = orders.find(o => {
+        if (o.phone !== orderPhone) return false;
+        if (Number(o.amountValue) !== amountNum) return false;
+        if (String(o.items || '') !== String(items || '')) return false;
+        const t = new Date(o.placedAt || o.timestamp || 0).getTime();
+        return nowMs - t < 90000;
+      });
+      if (recent) {
+        return res.json({ success: true, order: recent, duplicate: true });
       }
     }
 
@@ -2065,6 +2172,10 @@ const placeOrderHandler = async (req, res) => {
       mirrorOrderToFirestore(newOrder),
     ].map(p => Promise.race([p, new Promise(r => setTimeout(r, 3000))])));
     res.status(201).json({ success: true, order: newOrder, apiToken: mintApiToken(orderPhone, 'customer') });
+    } finally {
+      if (haveLock) releaseMemLock(lockKey);
+      if (haveRedisLock) await releaseOrderLock(lockKey);
+    }
   } catch (e) {
     console.error('Place order error:', e);
     res.status(500).json({ success: false, error: e.message });
@@ -2205,6 +2316,26 @@ async function createPaidOrder({ txnid, customerName, phone, address, items, tot
   if (!normalizedTxnid.startsWith('FM-')) {
     normalizedTxnid = `FM-${normalizedTxnid.replace(/^FM/i, '')}`;
   }
+  // ── Distributed lock: PayU/PhonePe send the success callback 2-3 times.
+  // First callback creates, the rest wait + get `duplicate: true`. Without
+  // this, two callbacks inside the same millisecond both pass the `existing`
+  // check below and write 2 identical rows.
+  const lockKey = `paid:${normalizedTxnid}`;
+  let haveLock = acquireMemLock(lockKey);
+  if (!haveLock) {
+    for (let i = 0; i < 20; i++) {
+      await sleep(250);
+      try {
+        const retryOrders = await readOrders();
+        const done = retryOrders.find(o => o.id === normalizedTxnid || o.orderId === normalizedTxnid || o.clientRef === clientRef);
+        if (done) return { order: done, duplicate: true };
+      } catch (_) {}
+      haveLock = acquireMemLock(lockKey);
+      if (haveLock) break;
+    }
+  }
+  const haveRedisLock = haveLock ? await acquireOrderLock(lockKey) : false;
+  try {
   const orders = await readOrders();
   const existing = orders.find(o => o.id === normalizedTxnid || o.orderId === normalizedTxnid || o.clientRef === clientRef);
   if (existing) return { order: existing, duplicate: true };
@@ -2272,6 +2403,10 @@ async function createPaidOrder({ txnid, customerName, phone, address, items, tot
     mirrorOrderToFirestore(newOrder),
   ].map(p => Promise.race([p, new Promise(r => setTimeout(r, 3000))])));
   return { order: newOrder, duplicate: false };
+  } finally {
+    if (haveLock) releaseMemLock(lockKey);
+    if (haveRedisLock) await releaseOrderLock(lockKey);
+  }
 }
 
 // ─── PAYMENT LEDGER (admin Payments page — no gateway login needed) ─────────
@@ -3617,22 +3752,18 @@ app.post('/api/orders/switch-to-prepaid', maintenanceGate, async (req, res) => {
     o.paymentStatus = 'PAID';
     o.paymentGateway = gw;
     o.gatewayTxnId = ref;
+    o.isConvertedFromCOD = true;
+    o.paymentConversion = {
+      isConvertedFromCOD: true,
+      convertedAt: new Date().toISOString(),
+      gateway: gw,
+      gatewayRef: ref || null,
+    };
     o.address = `${String(o.address || '').replace(/\s*\[(COD|CASH ON DELIVERY)\]/gi, '').trim()} [PREPAID - PAID ONLINE (${gw}${ref ? `: ${ref}` : ''})]`;
     o.updatedAt = new Date().toISOString();
     await writeOrders(orders);
-    try { mirrorOrderToFirestore(o); } catch (_) {}
-    // Firestore direct patch (payment fields aren't in mirror's allowlist).
-    try {
-      const db = adminDb();
-      if (db) {
-        await db.collection('orders').doc(String(o.id)).set({
-          paymentMode: 'PREPAID',
-          paymentStatus: 'PAID',
-          address: o.address,
-          updatedAt: new Date(),
-        }, { merge: true });
-      }
-    } catch (e) { console.error('switch-prepaid fs patch notice:', e.message); }
+    // Mirror now carries payment fields, so one call syncs admin + apps.
+    try { await mirrorOrderToFirestore(o); } catch (_) {}
     // Admin ledger trail.
     try { await logPayment({ ...o, payStatus: 'PAID', gateway: gw }); } catch (e) { console.error('switch-prepaid ledger notice:', e.message); }
     // Notify rider (topic) + customer history is auto-synced via Firestore stream.
