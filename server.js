@@ -683,16 +683,18 @@ function sendFcmToToken(token, title, body, data) {
         android: {
           priority: 'high',
           collapse_key: isCall ? 'foodmela_calls' : 'foodmela_customer_orders',
-          notification: {
-            sound: 'default',
-            channel_id: channelId,
-            tag: tag,
-            visibility: 'PUBLIC',
-            notification_priority: 'PRIORITY_MAX'
-          }
         }
       };
-      if (!isCall) msgBody.notification = { title, body };
+      if (!isCall) {
+        msgBody.notification = { title, body };
+        msgBody.android.notification = {
+          sound: 'default',
+          channel_id: channelId,
+          tag: tag,
+          visibility: 'PUBLIC',
+          notification_priority: 'PRIORITY_MAX'
+        };
+      }
       const payload = JSON.stringify({ message: msgBody });
       const req = https.request({ hostname: 'fcm.googleapis.com', path: `/v1/projects/${sa.project_id}/messages:send`, method: 'POST', headers: { 'Authorization': `Bearer ${fcmToken}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } }, (res) => {
         let d = '';
