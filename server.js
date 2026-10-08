@@ -611,9 +611,13 @@ function sanitizeOrder(o, viewer) {
 
   // Client App Compatibility: FoodMela Customer App evaluates `isCompleted = stage >= 4 || stage == -1`.
   // Backend stores delivered orders as stage 3 ('Delivered 🏁').
-  // For customer callers, when stage === 3 or status indicates delivered, map stage: 4
-  // so the un-updated mobile app classifies the order as completed and places it in Past Orders.
-  const isDelivered = Number(copy.stage ?? 0) === 3 || String(copy.status || '').toLowerCase().includes('deliver');
+  // For customer callers, when stage === 3 (or 4) or status genuinely indicates final delivery, map stage: 4
+  // so the mobile app classifies the delivered order as completed and places it in Past Orders.
+  // CRITICAL: NEVER treat stage 0 (placed), 1 (accepted), 2 (out for delivery), or -1 (cancelled) as delivered!
+  const stageNum = Number(copy.stage);
+  const statusStr = String(copy.status || '').toLowerCase().trim();
+  const isDelivered = (stageNum === 3 || stageNum === 4) ||
+    (![0, 1, 2, -1].includes(stageNum) && (statusStr === 'delivered' || statusStr.startsWith('delivered') || statusStr.includes('delivered 🏁')));
   if (isDelivered && (!viewer || viewer.role === 'customer')) {
     copy.stage = 4;
     copy.status = 'Delivered 🏁';
@@ -1356,7 +1360,7 @@ app.post('/api/calls-legacy-disabled/:orderId/request', maintenanceGate, async (
     // Delivered / cancelled → calling disabled for everyone.
     const stage = Number(order.stage ?? 0);
     const status = String(order.status || '').toLowerCase();
-    if (stage >= 3 || stage === -1 || status.includes('cancel') || status.includes('deliver')) {
+    if (stage >= 3 || stage === -1 || status.includes('cancel') || (status.includes('delivered') && !status.includes('out for delivery') && !status.includes('waiting for delivery'))) {
       return res.status(403).json({ success: false, error: 'Order completed — calling disabled' });
     }
     // Membership: customer phone or assigned rider only.
@@ -4926,7 +4930,8 @@ app.post('/api/orders/update-stage', requireRider, async (req, res) => {
     if (!orderId || newStage === undefined) {
       return res.status(400).json({ success: false, error: 'orderId and newStage required' });
     }
-    const stage = Number(newStage);
+    const rawStage = Number(newStage);
+    const stage = rawStage === 4 ? 3 : rawStage;
     if (![1, 2, 3].includes(stage)) {
       return res.status(400).json({ success: false, error: 'Invalid stage' });
     }
