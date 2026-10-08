@@ -136,6 +136,15 @@ const serveSitemap = (req, res) => {
 app.get('/sitemap.xml', serveSitemap);
 app.get('/api/sitemap.xml', serveSitemap);
 
+app.get(['/', '/api/health'], (req, res) => {
+  res.json({
+    status: 'online',
+    service: 'FoodMela Backend API',
+    version: '2.0',
+    time: new Date().toISOString()
+  });
+});
+
 // ─── 🔒 GOOGLE PLAY PRIVACY POLICY ──────────────────────────────────────────
 // Required by Google Play Console & Indian IT Act 2000 SPDI rules.
 // Serves /privacy.html, /privacy, /privacy-policy, /api/privacy.html.
