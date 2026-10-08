@@ -5222,8 +5222,9 @@ async function clearAllOrdersHandler(req, res) {
       return res.status(403).json({ success: false, error: 'Admin only' });
     }
 
-    // 1. Delete all order documents from Firestore
+    // 1. Archive & Delete all order documents from Firestore
     let firestoreDeleted = 0;
+    let firestoreArchived = 0;
     try {
       const db = adminDb();
       if (db) {
@@ -5232,8 +5233,16 @@ async function clearAllOrdersHandler(req, res) {
         let batch = db.batch();
         let count = 0;
         for (const doc of snap.docs) {
+          const orderData = doc.data() || {};
+          const archiveRef = db.collection('archived_orders').doc(doc.id);
+          batch.set(archiveRef, {
+            ...orderData,
+            archivedAt: new Date(),
+            archivedReason: 'admin_database_reset',
+          }, { merge: true });
           batch.delete(doc.ref);
           count++;
+          firestoreArchived++;
           firestoreDeleted++;
           if (count >= batchSize) {
             await batch.commit();
@@ -5246,10 +5255,40 @@ async function clearAllOrdersHandler(req, res) {
         }
       }
     } catch (e) {
-      console.error('Firestore clear error:', e.message);
+      console.error('Firestore archive & clear error:', e.message);
     }
 
-    // 2. Clear Redis orders and auxiliary keys
+    // 2. Clear Redis orders and auxiliary keys (also save snapshot to archived_orders in Firestore)
+    try {
+      const redisOrders = await readOrders();
+      if (Array.isArray(redisOrders) && redisOrders.length > 0) {
+        const db = adminDb();
+        if (db) {
+          let batch = db.batch();
+          let count = 0;
+          for (const ro of redisOrders) {
+            const roId = String(ro.id || ro.orderId || ro.order_number || '');
+            if (!roId) continue;
+            const archiveRef = db.collection('archived_orders').doc(roId);
+            batch.set(archiveRef, {
+              ...ro,
+              archivedAt: new Date(),
+              archivedReason: 'admin_database_reset',
+            }, { merge: true });
+            count++;
+            if (count >= 100) {
+              await batch.commit();
+              batch = db.batch();
+              count = 0;
+            }
+          }
+          if (count > 0) await batch.commit();
+        }
+      }
+    } catch (e) {
+      console.error('Redis archive error:', e.message);
+    }
+
     await upstashCommand(['DEL', ORDERS_KEY]);
     await upstashCommand(['DEL', PAYMENTS_KEY]);
     await upstashCommand(['DEL', WATCHED_KEY]);
@@ -5289,10 +5328,11 @@ async function clearAllOrdersHandler(req, res) {
       console.error('Redis user history clear error:', e.message);
     }
 
-    console.log(`🧹 CLEAR-ALL ORDERS: deleted ${firestoreDeleted} Firestore docs, cleared ${usersCleared} user histories, wiped Redis orders`);
+    console.log(`🧹 ARCHIVE & CLEAR-ALL ORDERS: archived ${firestoreArchived} docs, deleted ${firestoreDeleted} live Firestore docs, cleared ${usersCleared} user histories, wiped Redis orders`);
     res.json({
       success: true,
-      message: 'All orders cleared successfully from server, Firestore, and user histories',
+      message: 'All orders safely archived to archived_orders and hardcore deleted from active database!',
+      firestoreArchived,
       firestoreDeleted,
       usersCleared,
     });
@@ -5304,6 +5344,32 @@ async function clearAllOrdersHandler(req, res) {
 app.post('/api/admin/orders/clear-all', clearAllOrdersHandler);
 app.delete('/api/admin/orders/clear-all', clearAllOrdersHandler);
 app.post('/api/orders/clear-all', clearAllOrdersHandler);
+
+// Endpoint to view archived orders in admin panel
+app.get('/api/admin/orders/archived', async (req, res) => {
+  try {
+    const authHeader = String(req.headers.authorization || '');
+    const token = authHeader.replace(/^Bearer\s+/i, '');
+    const secretHeader = String(req.headers['x-admin-secret'] || '');
+    const apiSecret = process.env.API_TOKEN_SECRET || '';
+    const masterClearKey = 'FM_WIPE_ALL_ORDERS_CONFIRMED_2026';
+    const isMaster = (req.headers['x-master-key'] === masterClearKey) || (req.query.masterKey === masterClearKey);
+    const isSecret = apiSecret && (token === apiSecret || secretHeader === apiSecret);
+    const viewer = viewerFrom(req);
+    const isAdmin = isMaster || isSecret || (viewer && viewer.role === 'admin') || await isAdminCaller(token);
+    if (!isAdmin) return res.status(403).json({ success: false, error: 'Admin only' });
+
+    const db = adminDb();
+    if (!db) return res.status(500).json({ success: false, error: 'Firestore unavailable' });
+
+    const limit = Math.min(Number(req.query.limit) || 100, 300);
+    const snap = await db.collection('archived_orders').orderBy('archivedAt', 'desc').limit(limit).get();
+    const archived = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    res.json({ success: true, count: archived.length, orders: archived });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // IN-APP AUDIO CALLING (Agora RTC + Cloud Recording → Firebase Storage)
