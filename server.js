@@ -25,6 +25,8 @@ const app = express();
 const ALLOWED_ORIGINS = new Set([
   'https://foodmela.online',
   'https://www.foodmela.online',
+  'https://foodmela-admin.vercel.app',
+  'https://food-mela-admin.vercel.app',
   'https://food-mela-backend.vercel.app',
   'http://localhost:3000',
   'http://localhost:5173',
@@ -303,6 +305,37 @@ async function setMaintenance(enabled, eta) {
 app.get('/api/maintenance/status', async (req, res) => {
   const m = await getMaintenance();
   res.json({ success: true, enabled: m.enabled, eta: m.eta });
+});
+// Debug: list app_banners docs (admin only) — banner-not-showing diagnosis.
+app.get('/api/admin/debug/banners', async (req, res) => {
+  try {
+    const authHeader = String(req.headers.authorization || '');
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (!(await isAdminCaller(idToken))) {
+      return res.status(403).json({ success: false, error: 'admin only' });
+    }
+    const db = adminDb();
+    if (!db) return res.status(500).json({ success: false, error: 'firestore unavailable' });
+    const snap = await db.collection('app_banners').get();
+    const docs = snap.docs.map((d) => {
+      const m = d.data() || {};
+      return {
+        id: d.id,
+        title: m.title || '',
+        isActive: m.isActive,
+        isActiveType: typeof m.isActive,
+        sortOrder: m.sortOrder,
+        sortOrderType: typeof m.sortOrder,
+        hasImage: !!(m.imageUrl || m.image),
+        hasFrames: Array.isArray(m.frames) ? m.frames.length : 0,
+        startAt: m.startAt ? String(m.startAt.toDate ? m.startAt.toDate() : m.startAt) : null,
+        endAt: m.endAt ? String(m.endAt.toDate ? m.endAt.toDate() : m.endAt) : null,
+      };
+    });
+    res.json({ success: true, count: docs.length, docs });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 // Admin set — same isAdminCaller check jaise baaki admin endpoints.
 app.post('/api/admin/maintenance', async (req, res) => {
@@ -1998,7 +2031,8 @@ async function isAdminCaller(idToken) {
     const authAdmin = adminAuth();
     if (!authAdmin || !idToken) return false;
     const decoded = await authAdmin.verifyIdToken(idToken);
-    if ((decoded.email || '').toLowerCase() === 'admin@foodmela.com') return true;
+    const callerEmail = (decoded.email || '').toLowerCase();
+    if (callerEmail === 'admin@foodmela.com' || callerEmail === 'admin@foodmela.online') return true;
     const db = adminDb();
     if (db) {
       const snap = await db.collection('users').doc(decoded.uid).get();
@@ -2033,8 +2067,15 @@ app.post('/api/admin/broadcast', async (req, res) => {
     const sendTopicPush = async (topic, title, body) => {
       try {
         const token = await fcmAccessToken();
-        if (!token) return false;
+        if (!token) {
+          console.error(`[BROADCAST] FCM access token mint FAILED (check FCM_SERVICE_ACCOUNT env)`);
+          return false;
+        }
         const sa = fcmServiceAccount();
+        if (!sa || !sa.project_id) {
+          console.error(`[BROADCAST] FCM service account missing project_id`);
+          return false;
+        }
         const payload = JSON.stringify({
           message: {
             topic,
@@ -2070,19 +2111,26 @@ app.post('/api/admin/broadcast', async (req, res) => {
           }, (rs) => {
             let d = '';
             rs.on('data', (c) => { d += c; });
-            rs.on('end', () => resolve(rs.statusCode < 300));
+            rs.on('end', () => {
+              if (rs.statusCode >= 300) {
+                console.error(`[BROADCAST] FCM send to ${topic} FAILED (${rs.statusCode}): ${d.slice(0, 300)}`);
+              }
+              resolve(rs.statusCode < 300);
+            });
           });
-          request.on('error', () => resolve(false));
+          request.on('error', (e) => {
+            console.error(`[BROADCAST] FCM request error to ${topic}: ${e.message}`);
+            resolve(false);
+          });
           request.write(payload);
           request.end();
         });
-      } catch (_) { return false; }
+      } catch (e) { console.error(`[BROADCAST] sendTopicPush exception: ${e.message}`); return false; }
     };
 
-    // Broadcast to BOTH customers and delivery riders
+    // Broadcast to CUSTOMERS ONLY — riders never get marketing/offer pushes.
     const okCustomers = await sendTopicPush('all_customers', title, body);
-    const okRiders = await sendTopicPush('rider_notifications', title, body);
-    const ok = okCustomers || okRiders;
+    const ok = okCustomers;
 
     // Also mirror broadcast message to Firestore `broadcast_notifications` collection
     // so all in-app listeners, web clients, and real-time banners receive it instantly!
@@ -2099,8 +2147,8 @@ app.post('/api/admin/broadcast', async (req, res) => {
       }
     } catch (_) {}
 
-    console.log(ok ? `📢 [BROADCAST] "${title}" broadcasted to all users & riders` : `⚠️ [BROADCAST] failed: "${title}"`);
-    res.json({ success: true, pushed: ok, customers: okCustomers, riders: okRiders });
+    console.log(ok ? `📢 [BROADCAST] "${title}" broadcasted to customers only` : `⚠️ [BROADCAST] failed: "${title}"`);
+    res.json({ success: true, pushed: ok, customers: okCustomers });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -4176,6 +4224,12 @@ app.all('/api/payu/callback', async (req, res) => {
     if (!hashOk) console.warn(`⚠️ PayU hash mismatch for ${txnid} — still checking status`);
 
     if (status === 'success') {
+      // Wallet top-ups must NOT create food orders — the app credits the
+      // wallet itself via /api/payu/status polling. Skip createPaidOrder.
+      if (String(txnid).startsWith('WALLET-')) {
+        console.log(`✅ WALLET TOP-UP via PayU: ${txnid} (₹${d.amount}) — no food order created`);
+        return res.redirect(303, `https://foodmela.online/?paid=1&orderId=${encodeURIComponent(txnid)}`);
+      }
       const draft = await getDraftOrder(txnid);
       const { order } = await createPaidOrder({
         txnid,
@@ -4296,6 +4350,17 @@ app.get('/api/payu/status/:txnid', async (req, res) => {
 
           const statusLower = String(txnData?.status || '').toLowerCase();
           if (statusLower === 'success') {
+            // Wallet top-ups: report success WITHOUT creating a food order.
+            if (String(rawTxnid).startsWith('WALLET-') ||
+                String(normalizedTxnid).startsWith('WALLET-')) {
+              return res.json({
+                success: true,
+                status: 'success',
+                isPaid: true,
+                orderId: rawTxnid,
+                details: txnData
+              });
+            }
             try {
               let draft = null;
               for (const cand of idVariants) {
