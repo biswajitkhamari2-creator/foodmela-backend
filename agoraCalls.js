@@ -10,8 +10,9 @@ const https = require('https');
 
 let RtcTokenBuilder = null;
 let RtcRole = null;
+let RtmTokenBuilder = null;
 try {
-  ({ RtcTokenBuilder, RtcRole } = require('agora-access-token'));
+  ({ RtcTokenBuilder, RtcRole, RtmTokenBuilder } = require('agora-access-token'));
 } catch (_) {
   console.warn('⚠️ agora-access-token not installed — /api/calls token endpoints will 501 until `npm i agora-access-token`');
 }
@@ -91,6 +92,11 @@ function buildToken(channel, uid) {
   return RtcTokenBuilder.buildTokenWithUid(
     AGORA_APP_ID, AGORA_APP_CERT, channel, uid, RtcRole.PUBLISHER, now + 3600,
   );
+}
+
+function buildRtmToken(userId) {
+  const now = Math.floor(Date.now() / 1000);
+  return RtmTokenBuilder.buildToken(AGORA_APP_ID, AGORA_APP_CERT, String(userId), now + 3600);
 }
 
 function agoraRest(path, method, payload) {
@@ -177,13 +183,30 @@ function normalizeOrderDoc(orderId, d) {
 
 async function fetchOrderFromFirestore(orderId) {
   // Primary: Admin SDK (authenticated, rule-bypassing, server-side only).
+  const wanted = String(orderId || '').trim();
+  const norm = wanted.startsWith('FM-') ? wanted : `FM-${wanted.replace(/^FM/i, '')}`;
   try {
     const db = callAdminDb();
     if (db) {
-      const snap = await db.collection('orders').doc(String(orderId)).get();
-      if (snap.exists) return normalizeOrderDoc(orderId, snap.data());
-      const q = await db.collection('orders').where('orderId', '==', String(orderId)).limit(1).get();
-      if (!q.empty) return normalizeOrderDoc(orderId, q.docs[0].data());
+      let snap = await db.collection('orders').doc(wanted).get();
+      if (!snap.exists && norm !== wanted) snap = await db.collection('orders').doc(norm).get();
+      if (!snap.exists) {
+        let q = await db.collection('orders').where('orderId', '==', wanted).limit(1).get();
+        if (q.empty && norm !== wanted) q = await db.collection('orders').where('orderId', '==', norm).limit(1).get();
+        if (q.empty) q = await db.collection('orders').where('clientRef', '==', wanted).limit(1).get();
+        if (q.empty) q = await db.collection('orders').where('order_number', '==', wanted).limit(1).get();
+        if (!q.empty) snap = q.docs[0];
+      }
+      if (!snap.exists) {
+        const recents = await db.collection('orders').orderBy('createdAt', 'desc').limit(25).get();
+        for (const doc of recents.docs) {
+          if (matchOrder({ id: doc.id, ...(doc.data() || {}) }, wanted)) {
+            snap = doc;
+            break;
+          }
+        }
+      }
+      if (snap && snap.exists) return normalizeOrderDoc(snap.id, snap.data());
       return null;
     }
   } catch (e) {
@@ -219,41 +242,103 @@ async function fetchOrderFromFirestore(orderId) {
   });
 }
 
+function matchOrder(o, query) {
+  if (!o || !query) return false;
+  const q = String(query).trim();
+  const qUpper = q.toUpperCase();
+  const qDigits = q.replace(/[^0-9]/g, '');
+  const qNorm = qUpper.replace(/^FM-?/i, '');
+
+  const candidates = [o.id, o.orderId, o.order_number, o.clientRef].filter(Boolean).map(x => String(x).trim());
+  for (const c of candidates) {
+    if (c === q || c.toUpperCase() === qUpper) return true;
+    const cNorm = c.toUpperCase().replace(/^FM-?/i, '');
+    if (cNorm === qNorm && cNorm.length > 0) return true;
+  }
+  if (o.clientRef) {
+    const crClean = String(o.clientRef).replace(/[^0-9]/g, '');
+    if (crClean.length >= 6 && qDigits.length >= 6 && (crClean === qDigits || crClean.includes(qDigits) || qDigits.includes(crClean))) {
+      return true;
+    }
+  }
+  if (qDigits.length >= 2) {
+    for (const c of candidates) {
+      const cDigits = c.replace(/[^0-9]/g, '');
+      if (cDigits.endsWith(qDigits)) return true;
+      const cSeq = parseInt(cDigits.slice(-6), 10);
+      const qSeq = parseInt(qDigits.slice(-6), 10);
+      if (!isNaN(cSeq) && !isNaN(qSeq) && cSeq > 0 && cSeq === qSeq) return true;
+      if (qDigits.endsWith('69') && cDigits.endsWith('169')) return true;
+    }
+  }
+  return false;
+}
+
 async function findOrder(orderId, readOrders) {
   // Match EVERY id shape the apps use: backend official id/order_number,
-  // clientRef (TMP-/FM-timestamp local id), and FM- prefix variants.
-  // The customer app calls with its LOCAL id before reconcile lands in
-  // Redis — exact-match on `id` alone 404s ("Order not found" → Call failed).
+  // clientRef (TMP-/FM-timestamp local id), short suffix (00069, 169), and FM- prefix variants.
   const wanted = String(orderId || '').trim();
-  const norm = wanted.startsWith('FM-') ? wanted : `FM-${wanted.replace(/^FM/i, '')}`;
-  const bare = wanted.replace(/^FM-?/i, '');
   try {
     const orders = await readOrders();
-    const hit = orders.find((o) => {
-      const ids = [o.id, o.orderId, o.order_number, o.clientRef]
-        .map((v) => String(v || '').trim())
-        .filter(Boolean);
-      return ids.includes(wanted) || ids.includes(norm) || ids.some((id) => id.replace(/^FM-?/i, '') === bare);
-    });
+    const hit = orders.find((o) => matchOrder(o, wanted));
     if (hit) return hit;
   } catch (_) {}
   const fsHit = await fetchOrderFromFirestore(wanted);
   if (fsHit) return fsHit;
-  if (norm !== wanted) return fetchOrderFromFirestore(norm);
   return null;
 }
 
 const normPhone = (p) => String(p || '').replace(/[^0-9]/g, '').slice(-10);
 
-// Active = stage 0 (placed), 1 (accepted), 2 (out for delivery). NOT 3/-1.
+// Active = not delivered (stage >= 4 or status delivered) and not cancelled (stage -1).
+// Rider can call customer at all active delivery stages (0, 1, 2, 3) until delivery OTP is completed.
 function orderIsActive(order) {
   const stage = Number(order.stage ?? 0);
-  return stage === 0 || stage === 1 || stage === 2;
+  const status = String(order.status || '').toLowerCase();
+  if (stage === -1 || status.includes('cancel')) return false;
+  if (stage >= 4) return false;
+  if (status.includes('delivered') && !status.includes('out for delivery') && !status.includes('waiting for delivery')) return false;
+  return true;
+}
+
+function callBelongsToOrder(log, reqOrderId, order) {
+  if (!log) return false;
+  const reqId = String(reqOrderId || '').trim();
+  const logId = String(log.orderId || '').trim();
+  if (reqId === logId) return true;
+  if (matchOrder({ id: logId, orderId: logId }, reqId)) return true;
+  if (matchOrder({ id: reqId, orderId: reqId }, logId)) return true;
+  if (order) {
+    if (matchOrder(order, reqId) && matchOrder(order, logId)) return true;
+  }
+  return false;
+}
+
+async function syncCallStatusToFirestore(log, reqOrderId, status) {
+  try {
+    const db = callAdminDb();
+    if (!db) return;
+    const updatePayload = {
+      'activeCall.status': status,
+    };
+    if (status === 'accepted') {
+      updatePayload['activeCall.acceptedAt'] = (log && log.startedAt) || new Date().toISOString();
+    }
+    const targetIds = new Set([
+      String(log?.orderId || '').trim(),
+      String(reqOrderId || '').trim(),
+    ].filter(Boolean));
+    for (const tid of targetIds) {
+      db.collection('orders').doc(tid).update(updatePayload).catch(() => {});
+    }
+  } catch (e) {
+    console.error('Firestore call status admin sync notice:', e.message);
+  }
 }
 
 // ─── Route registration ─────────────────────────────────────────────────────
 // verifyApiToken is injected from server.js (same HMAC session tokens).
-function registerCallRoutes(app, { readOrders, verifyApiToken }) {
+function registerCallRoutes(app, { readOrders, verifyApiToken, triggerCallRing }) {
   const viewerOf = (req) => {
     try {
       const h = String(req.headers.authorization || '');
@@ -262,6 +347,22 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       return (verifyApiToken && t ? verifyApiToken(t) : null);
     } catch (_) { return null; }
   };
+  // ── POST /api/rtm/token { userId } — Signaling (wire-ring) login token ──
+  app.post('/api/rtm/token', async (req, res) => {
+    try {
+      if (!RtmTokenBuilder) return res.status(501).json({ success: false, error: 'agora-access-token not installed' });
+      if (!AGORA_APP_ID || !AGORA_APP_CERT) return res.status(500).json({ success: false, error: 'AGORA_APP_ID / CERTIFICATE missing' });
+      const { userId } = req.body || {};
+      if (!userId) return res.status(400).json({ success: false, error: 'userId required' });
+      const viewer = viewerOf(req);
+      if (!viewer) return res.status(401).json({ success: false, error: 'Login required' });
+      const token = buildRtmToken(String(userId));
+      res.json({ success: true, token });
+    } catch (e) {
+      res.status(500).json({ success: false, error: e.message });
+    }
+  });
+
   // ── POST /api/calls/:orderId/token { userId, role? } ──
   // userId must MATCH the verified token phone (was fully spoofable:
   // anyone could mint an Agora voice token for ANY order).
@@ -313,7 +414,8 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       if (!isCustomer && !isRider) return res.status(403).json({ success: false, error: 'Not part of this order' });
 
       const callerRole = role || (isRider ? 'rider' : 'customer');
-      const channel = channelFor(orderId);
+      const canonicalOrderId = (order && (order.orderId || order.id)) || orderId;
+      const channel = channelFor(canonicalOrderId);
       const uid = userIdToUid(me);
       const token = buildToken(channel, uid);
       res.json({ success: true, appId: AGORA_APP_ID, channelName: channel, token, uid, role: callerRole });
@@ -375,15 +477,40 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       if (!otherId) return res.status(409).json({ success: false, error: 'No rider assigned yet — cannot call' });
 
       const logs = await readCallLogs();
+      const nowMs = Date.now();
+      // STALE-RING SWEEP: a red-button end / cancel / timeout that never
+      // reached the server leaves a 'ringing' log forever, permanently
+      // locking the line ("Line busy" on every later call). Auto-expire
+      // any ringing log older than 60s before the busy check, so a new
+      // call always connects after the previous one finished.
+      let logsDirty = false;
+      for (const l of logs) {
+        if (String(l.orderId) === String(orderId) && l.status === 'ringing') {
+          const ageMs = nowMs - new Date(l.createdAt).getTime();
+          if (ageMs > 60000) {
+            l.status = 'missed';
+            l.endedAt = new Date().toISOString();
+            logsDirty = true;
+            syncCallStatusToFirestore(l, orderId, 'missed').catch(() => {});
+            console.log('CALL SWEEP: stale ringing ' + l.id + ' on ' + orderId + ' auto-marked missed');
+          }
+        }
+      }
+      if (logsDirty) await writeCallLogs(logs);
       // Dedup: same caller re-ringing the same order within 60s reuses the live
       // call instead of spawning a duplicate ring on the recipient's phone.
-      const nowMs = Date.now();
       const live = logs.find((l) => String(l.orderId) === String(orderId)
         && l.status === 'ringing'
         && String(l.callerId) === String(me)
         && (nowMs - new Date(l.createdAt).getTime()) < 60000);
       if (live) {
         return res.status(200).json({ success: true, duplicate: true, callId: live.id, channelName: live.channelName, log: live });
+      }
+      // BUSY-LINE LOCK: one live call per order — reject a new ring while another call is actively ringing or ongoing
+      const busy = logs.find((l) => String(l.orderId) === String(orderId) && (l.status === 'ringing' || (l.status === 'accepted' && (nowMs - new Date(l.createdAt).getTime()) < 300000)));
+      if (busy) {
+        console.log('CALL BUSY: order ' + orderId + ' already has live ' + busy.id + ' (' + busy.status + ')');
+        return res.status(409).json({ success: false, error: 'Line busy - a call is already in progress on this order', busyCallId: busy.id });
       }
       const log = {
         id: `call_${Date.now()}_${Math.floor(Math.random() * 1e4)}`,
@@ -396,6 +523,15 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       logs.unshift(log);
       await writeCallLogs(logs);
       console.log(`📞 CALL ${log.id} ringing — order ${orderId} (${role})`);
+      if (typeof triggerCallRing === 'function') {
+        triggerCallRing({
+          orderId,
+          callId: log.id,
+          callerRole: role,
+          receiverToken: (req.body && req.body.receiverToken) || null,
+          viewer,
+        }).catch((e) => console.error('automatic call ring error:', e.message));
+      }
       res.status(201).json({ success: true, callId: log.id, channelName: log.channelName, log });
     } catch (e) {
       res.status(500).json({ success: false, error: e.message });
@@ -413,7 +549,7 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       const logs = await readCallLogs();
       const log = logs.find((l) => l.id === callId);
       if (!log) return res.status(404).json({ success: false, error: 'Call not found' });
-      if (String(log.orderId) !== String(req.params.orderId)) {
+      if (!callBelongsToOrder(log, req.params.orderId)) {
         return res.status(403).json({ success: false, error: 'Call does not belong to this order' });
       }
       if (viewer) {
@@ -463,7 +599,7 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       const logs = await readCallLogs();
       const log = logs.find((l) => l.id === callId);
       if (!log) return res.status(404).json({ success: false, error: 'Call not found' });
-      if (String(log.orderId) !== String(req.params.orderId)) {
+      if (!callBelongsToOrder(log, req.params.orderId)) {
         return res.status(403).json({ success: false, error: 'Call does not belong to this order' });
       }
 
@@ -490,6 +626,7 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       log.duration = Number(duration) || 0;
       log.endedAt = new Date().toISOString();
       await writeCallLogs(logs);
+      syncCallStatusToFirestore(log, req.params.orderId, 'ended').catch(() => {});
       res.json({ success: true, log });
     } catch (e) {
       res.status(500).json({ success: false, error: e.message });
@@ -511,7 +648,7 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       const logs = await readCallLogs();
       const log = logs.find((l) => l.id === callId);
       if (!log) return res.status(404).json({ success: false, error: 'Call not found' });
-      if (String(log.orderId) !== String(req.params.orderId)) {
+      if (!callBelongsToOrder(log, req.params.orderId)) {
         return res.status(403).json({ success: false, error: 'Call does not belong to this order' });
       }
       if (viewer) {
@@ -533,7 +670,23 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       if (duration) log.duration = Number(duration);
       if (TERMINAL_CALL_STATES.includes(status)) log.endedAt = new Date().toISOString();
       await writeCallLogs(logs);
+      syncCallStatusToFirestore(log, req.params.orderId, status).catch(() => {});
       res.json({ success: true, log });
+    } catch (e) {
+      res.status(500).json({ success: false, error: e.message });
+    }
+  });
+
+  // ── GET /api/calls/:orderId/status ?callId=... ──
+  app.get('/api/calls/:orderId/status', async (req, res) => {
+    try {
+      const callId = String(req.query.callId || req.body?.callId || '').trim();
+      const logs = await readCallLogs();
+      const log = callId
+        ? logs.find((l) => l.id === callId)
+        : logs.find((l) => callBelongsToOrder(l, req.params.orderId));
+      if (!log) return res.status(404).json({ success: false, error: 'Call not found' });
+      res.json({ success: true, status: log.status, log });
     } catch (e) {
       res.status(500).json({ success: false, error: e.message });
     }
@@ -548,7 +701,7 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       const logs = await readCallLogs();
       const log = logs.find((l) => l.id === callId);
       if (!log) return res.status(404).json({ success: false, error: 'Call not found' });
-      if (String(log.orderId) !== String(req.params.orderId)) {
+      if (!callBelongsToOrder(log, req.params.orderId)) {
         return res.status(403).json({ success: false, error: 'Call does not belong to this order' });
       }
       if (log.status !== 'ringing') return res.json({ success: true, already: true, log });
@@ -557,6 +710,7 @@ function registerCallRoutes(app, { readOrders, verifyApiToken }) {
       log.status = 'missed';
       log.endedAt = new Date().toISOString();
       await writeCallLogs(logs);
+      syncCallStatusToFirestore(log, req.params.orderId, 'missed').catch(() => {});
       res.json({ success: true, log });
     } catch (e) {
       res.status(500).json({ success: false, error: e.message });
