@@ -277,15 +277,24 @@ function matchOrder(o, query) {
 async function findOrder(orderId, readOrders) {
   // Match EVERY id shape the apps use: backend official id/order_number,
   // clientRef (TMP-/FM-timestamp local id), short suffix (00069, 169), and FM- prefix variants.
+  //
+  // Upstash and Firestore are queried CONCURRENTLY. They were serial (Upstash
+  // → Firestore), so every call paid both round-trips back-to-back on the
+  // critical path of POST /request — the endpoint that gates the ring. They
+  // answer the same question, so racing them costs one round-trip instead of
+  // two and the caller rings sooner. Prefer the Upstash hit when both land
+  // (it is the cheaper/authoritative read for live orders).
   const wanted = String(orderId || '').trim();
-  try {
-    const orders = await readOrders();
-    const hit = orders.find((o) => matchOrder(o, wanted));
-    if (hit) return hit;
-  } catch (_) {}
-  const fsHit = await fetchOrderFromFirestore(wanted);
-  if (fsHit) return fsHit;
-  return null;
+  const [redisHit, fsHit] = await Promise.all([
+    (async () => {
+      try {
+        const orders = await readOrders();
+        return orders.find((o) => matchOrder(o, wanted)) || null;
+      } catch (_) { return null; }
+    })(),
+    fetchOrderFromFirestore(wanted).catch(() => null),
+  ]);
+  return redisHit || fsHit || null;
 }
 
 const normPhone = (p) => String(p || '').replace(/[^0-9]/g, '').slice(-10);
@@ -335,6 +344,33 @@ async function syncCallStatusToFirestore(log, reqOrderId, status) {
     console.error('Firestore call status admin sync notice:', e.message);
   }
 }
+
+// ─── Call timing constants ──────────────────────────────────────────────────
+// SINGLE SOURCE OF TRUTH. These MUST agree with the client, or the server
+// holds a "live" line long after the caller's phone has given up — every later
+// attempt on that order then fails with "Line busy" (the ghost lock).
+//
+// Client reality (both apps):
+//   • CallKitParams.duration          = 45_000 ms  (native ring timeout)
+//   • CallLauncher._waitForAnswer     = 45 s       (caller gives up)
+//   • FCM android.ttl for calls       = 45s
+// So 45s is the longest a ring can legitimately exist.
+const RING_TIMEOUT_MS = 45_000;
+// Small allowance for the receiver's Accept to land just after the caller's UI
+// gave up. Kept SHORT: every extra second here is a second the SAME caller's
+// retry is rejected with a false "Line busy", which is the ghost-lock users
+// actually hit. A ring silent for >RING_TIMEOUT_MS and never answered is dead.
+const RING_ABANDON_GRACE_MS = 5_000;
+// An ACCEPTED call with no recording/heartbeat: the app was killed or lost
+// network mid-call, so nothing will ever POST /timeout or /end for it. 300s was
+// far too long — five minutes of "Line busy" after a single dropped call.
+const ACCEPTED_STALE_MS = 90_000;
+
+// A caller who re-rings after abandoning their OWN previous attempt must never
+// be told "Line busy" by their own dead ring. Inside this window a same-caller
+// retry SUPERSEDES the old ringing log instead of being blocked by it.
+// (Different callers on the same order are still serialised by the busy check.)
+const SELF_RETRY_SUPERSEDE_MS = 90_000;
 
 // ─── Route registration ─────────────────────────────────────────────────────
 // verifyApiToken is injected from server.js (same HMAC session tokens).
@@ -478,39 +514,92 @@ function registerCallRoutes(app, { readOrders, verifyApiToken, triggerCallRing }
 
       const logs = await readCallLogs();
       const nowMs = Date.now();
-      // STALE-RING SWEEP: a red-button end / cancel / timeout that never
-      // reached the server leaves a 'ringing' log forever, permanently
-      // locking the line ("Line busy" on every later call). Auto-expire
-      // any ringing log older than 60s before the busy check, so a new
-      // call always connects after the previous one finished.
+      // ── STALE-CALL SWEEP ────────────────────────────────────────────────
+      // Every abandoned call must be retired here, or it locks the line and
+      // every later attempt returns "Line busy" (the ghost lock). Two ways a
+      // call is abandoned without the server hearing about it:
+      //
+      //  1. 'ringing' — the caller's red button / UI timeout (45s) fires while
+      //     the app is killed, so POST /timeout or /end never arrives.
+      //  2. 'accepted' — the app was killed or lost network mid-call, so the
+      //     end-of-call POST never arrives. This was not swept at all before,
+      //     leaving the line held for the full 300s accept window.
+      //
+      // A call silent for longer than its legitimate maximum is retired as
+      // missed/ended. Both use the phone's own 45s ring timeout as the base.
       let logsDirty = false;
       for (const l of logs) {
-        if (String(l.orderId) === String(orderId) && l.status === 'ringing') {
-          const ageMs = nowMs - new Date(l.createdAt).getTime();
-          if (ageMs > 60000) {
-            l.status = 'missed';
-            l.endedAt = new Date().toISOString();
-            logsDirty = true;
-            syncCallStatusToFirestore(l, orderId, 'missed').catch(() => {});
-            console.log('CALL SWEEP: stale ringing ' + l.id + ' on ' + orderId + ' auto-marked missed');
-          }
+        if (String(l.orderId) !== String(orderId)) continue;
+        const createdAtMs = new Date(l.createdAt).getTime();
+        // Use the last known activity, not just creation: an accepted call
+        // starts counting from startedAt, and the recorder updates startedAt.
+        const lastMs = new Date(l.startedAt || l.createdAt).getTime();
+        const refMs = Number.isFinite(lastMs) ? lastMs : createdAtMs;
+        const ageMs = nowMs - refMs;
+
+        if (l.status === 'ringing' && nowMs - createdAtMs > RING_TIMEOUT_MS + RING_ABANDON_GRACE_MS) {
+          l.status = 'missed';
+          l.endedAt = new Date().toISOString();
+          logsDirty = true;
+          syncCallStatusToFirestore(l, orderId, 'missed').catch(() => {});
+          console.log('CALL SWEEP: abandoned ringing ' + l.id + ' on ' + orderId + ' -> missed (age ' + Math.round(ageMs / 1000) + 's)');
+        } else if (l.status === 'accepted' && ageMs > ACCEPTED_STALE_MS) {
+          l.status = 'ended';
+          l.endedAt = new Date().toISOString();
+          logsDirty = true;
+          syncCallStatusToFirestore(l, orderId, 'ended').catch(() => {});
+          console.log('CALL SWEEP: stale accepted ' + l.id + ' on ' + orderId + ' -> ended (silent ' + Math.round(ageMs / 1000) + 's)');
         }
       }
       if (logsDirty) await writeCallLogs(logs);
-      // Dedup: same caller re-ringing the same order within 60s reuses the live
-      // call instead of spawning a duplicate ring on the recipient's phone.
+      // Dedup: same caller re-ringing the same order within the ring window
+      // reuses the live call instead of spawning a duplicate ring on the
+      // recipient's phone. Bounded by RING_TIMEOUT_MS, not an arbitrary 60s,
+      // so a retry after a genuine miss is never swallowed as a "duplicate".
       const live = logs.find((l) => String(l.orderId) === String(orderId)
         && l.status === 'ringing'
         && String(l.callerId) === String(me)
-        && (nowMs - new Date(l.createdAt).getTime()) < 60000);
+        && (nowMs - new Date(l.createdAt).getTime()) < RING_TIMEOUT_MS);
       if (live) {
         return res.status(200).json({ success: true, duplicate: true, callId: live.id, channelName: live.channelName, log: live });
       }
-      // BUSY-LINE LOCK: one live call per order — reject a new ring while another call is actively ringing or ongoing
-      const busy = logs.find((l) => String(l.orderId) === String(orderId) && (l.status === 'ringing' || (l.status === 'accepted' && (nowMs - new Date(l.createdAt).getTime()) < 300000)));
+      // ── BUSY-LINE LOCK ──────────────────────────────────────────────────
+      // One live call per order. The sweep above has already retired anything
+      // abandoned, so this only rejects a call that is genuinely in progress.
+      //
+      // EXCEPTION — self-retry supersede: if the only thing holding the line is
+      // the SAME caller's own ringing attempt, let them replace it. Without
+      // this, a caller whose earlier ring was never answered gets "Line busy"
+      // from their OWN ghost: the ring push died (killed receiver), so no
+      // /timeout or /end ever reached the server, and the caller is locked out
+      // of their own call for the whole window. The receiver was never going to
+      // answer that dead ring, so retiring it costs nothing and unblocks the
+      // retry the user is actually asking for.
+      const busy = logs.find((l) => String(l.orderId) === String(orderId)
+        && (l.status === 'ringing' || l.status === 'accepted'));
       if (busy) {
-        console.log('CALL BUSY: order ' + orderId + ' already has live ' + busy.id + ' (' + busy.status + ')');
-        return res.status(409).json({ success: false, error: 'Line busy - a call is already in progress on this order', busyCallId: busy.id });
+        const busyAgeMs = nowMs - new Date(busy.startedAt || busy.createdAt).getTime();
+        const isOwnDeadRing = busy.status === 'ringing'
+          && String(busy.callerId) === String(me)
+          && busyAgeMs > RING_TIMEOUT_MS
+          && busyAgeMs < SELF_RETRY_SUPERSEDE_MS;
+        if (isOwnDeadRing) {
+          busy.status = 'missed';
+          busy.endedAt = new Date().toISOString();
+          await writeCallLogs(logs);
+          syncCallStatusToFirestore(busy, orderId, 'missed').catch(() => {});
+          console.log(`CALL SUPERSEDE: caller re-ringing own dead ${busy.id} on ${orderId} (age ${Math.round(busyAgeMs / 1000)}s) -> missed, new ring allowed`);
+        } else {
+          console.log('CALL BUSY: order ' + orderId + ' already has live ' + busy.id + ' (' + busy.status + ')');
+          return res.status(409).json({
+            success: false,
+            error: 'Line busy - a call is already in progress on this order',
+            busyCallId: busy.id,
+            busyStatus: busy.status,
+            busyCallerRole: busy.callerRole,
+            busyAgeMs,
+          });
+        }
       }
       const log = {
         id: `call_${Date.now()}_${Math.floor(Math.random() * 1e4)}`,
@@ -694,7 +783,9 @@ function registerCallRoutes(app, { readOrders, verifyApiToken, triggerCallRing }
 
   // ── POST /api/calls/:orderId/timeout { callId } ──
   // Server-side missed-call sweeper: any caller (or cron) can mark a ringing
-  // call older than 45s as missed, so stale rings never haunt the recipient.
+  // call older than the ring window as missed, so stale rings never haunt the
+  // recipient. Threshold comes from RING_TIMEOUT_MS so it can never drift out
+  // of sync with the client or with the stale-call sweep above.
   app.post('/api/calls/:orderId/timeout', async (req, res) => {
     try {
       const { callId } = req.body || {};
@@ -706,7 +797,7 @@ function registerCallRoutes(app, { readOrders, verifyApiToken, triggerCallRing }
       }
       if (log.status !== 'ringing') return res.json({ success: true, already: true, log });
       const ageMs = Date.now() - new Date(log.createdAt).getTime();
-      if (ageMs < 45000) return res.json({ success: true, tooEarly: true, log });
+      if (ageMs < RING_TIMEOUT_MS) return res.json({ success: true, tooEarly: true, log });
       log.status = 'missed';
       log.endedAt = new Date().toISOString();
       await writeCallLogs(logs);

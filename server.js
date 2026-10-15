@@ -117,7 +117,6 @@ const SITEMAP_XML = `<?xml version="1.0" encoding="UTF-8"?>
   <url><loc>https://foodmela.online/</loc><lastmod>2026-09-19</lastmod><changefreq>daily</changefreq><priority>1.0</priority></url>
   <url><loc>https://foodmela.online/grocery</loc><lastmod>2026-09-19</lastmod><changefreq>daily</changefreq><priority>0.9</priority></url>
   <url><loc>https://foodmela.online/offers</loc><lastmod>2026-09-19</lastmod><changefreq>daily</changefreq><priority>0.8</priority></url>
-  <url><loc>https://foodmela.online/apk</loc><lastmod>2026-09-19</lastmod><changefreq>weekly</changefreq><priority>0.8</priority></url>
   <url><loc>https://foodmela.online/page/about</loc><lastmod>2026-09-19</lastmod><changefreq>monthly</changefreq><priority>0.8</priority></url>
   <url><loc>https://foodmela.online/page/contact</loc><lastmod>2026-09-19</lastmod><changefreq>monthly</changefreq><priority>0.8</priority></url>
   <url><loc>https://foodmela.online/page/help</loc><lastmod>2026-09-19</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>
@@ -156,7 +155,7 @@ const PRIVACY_HTML = `<!doctype html>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Privacy Policy — FoodMela</title>
-<meta name="description" content="Official Privacy Policy for FoodMela Food Delivery mobile application and services operated by SIDHESWAR ENTERPRISES." />
+<meta name="description" content="Official Privacy Policy for FoodMela Food Delivery mobile application and services operated by Biswajit Khamari." />
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; max-width: 860px; margin: 0 auto; padding: 32px 20px; line-height: 1.7; color: #1e293b; background: #fff; }
   h1 { color: #0a5c2f; font-size: 28px; margin-bottom: 8px; border-bottom: 2px solid #0a5c2f; padding-bottom: 12px; }
@@ -178,15 +177,15 @@ const PRIVACY_HTML = `<!doctype html>
 <p>Welcome to <strong>FoodMela</strong> ("we", "our", or "us"). We are committed to protecting your privacy and handling your personal information with full transparency and care. This Privacy Policy governs your use of the FoodMela mobile application (available on Google Play) and our website at <a href="https://foodmela.online">foodmela.online</a>.</p>
 
 <div class="entity-card">
-  <h3 style="margin-top:0;color:#0a5c2f;">📋 Legal Entity &amp; Grievance Redressal</h3>
+  <h3 style="margin-top:0;color:#0a5c2f;">📋 Legal Operating Entity &amp; Registered Address</h3>
   <ul style="margin:0;padding-left:18px;">
-    <li><strong>Legal Operating Entity:</strong> SIDHESWAR ENTERPRISES</li>
+    <li><strong>Legal Operating Entity:</strong> Biswajit Khamari (Biswajitkhamari)</li>
+    <li><strong>Proprietor / Owner:</strong> Biswajit Khamari</li>
     <li><strong>MSME Udyam Registration No:</strong> UDYAM-OD-29-0025578</li>
-    <li><strong>Platform / Application Name:</strong> FoodMela (foodmela.online)</li>
-    <li><strong>Operating Base &amp; Registered Address:</strong> Birmaharajpur, Subarnapur District, Odisha – 767018, India</li>
-    <li><strong>Grievance Officer:</strong> Grievance Officer, FoodMela Customer Support</li>
+    <li><strong>Platform &amp; E-Commerce Website:</strong> FoodMela (<a href="https://foodmela.online">https://foodmela.online</a>)</li>
+    <li><strong>Registered Office &amp; Operating Base:</strong> At/PO: Birmaharajpur, Subarnapur District, Odisha – 767018, India</li>
+    <li><strong>Customer Care Helpline:</strong> +91 8144503650</li>
     <li><strong>Support &amp; Grievance Email:</strong> <a href="mailto:support@foodmela.online">support@foodmela.online</a></li>
-    <li><strong>Direct Helpline:</strong> +91 8144503650</li>
   </ul>
 </div>
 
@@ -248,16 +247,18 @@ const PRIVACY_HTML = `<!doctype html>
 <p>We enforce industry-standard security safeguards including TLS/HTTPS data-in-transit encryption, secure session tokens, and strict Firestore access rules to safeguard your data against unauthorized access, loss, or misuse.</p>
 
 <h2>8. Contact &amp; Grievance Redressal</h2>
-<p>For any queries, feedback, or data privacy concerns regarding this policy, please reach out to us at:</p>
+<p>For any queries, feedback, or data privacy concerns regarding this policy, please reach out to our Grievance Redressal Cell:</p>
 <p>
-  <strong>SIDHESWAR ENTERPRISES (FoodMela)</strong><br />
-  Birmaharajpur, Subarnapur, Odisha – 767018, India<br />
-  <strong>Email:</strong> <a href="mailto:support@foodmela.online">support@foodmela.online</a><br />
-  <strong>Helpline:</strong> +91 8144503650<br />
-  <strong>Website:</strong> <a href="https://foodmela.online">https://foodmela.online</a>
+  <strong>Designated Grievance Officer:</strong> Jitendriya Amat<br />
+  <strong>Legal Entity:</strong> Biswajit Khamari (FoodMela)<br />
+  <strong>Proprietor:</strong> Biswajit Khamari<br />
+  <strong>Registered Office:</strong> At/PO: Birmaharajpur, Subarnapur District, Odisha – 767018, India<br />
+  <strong>Customer Care Helpline:</strong> +91 8144503650<br />
+  <strong>Support &amp; Grievance Email:</strong> <a href="mailto:support@foodmela.online">support@foodmela.online</a><br />
+  <strong>Official Website:</strong> <a href="https://foodmela.online">https://foodmela.online</a>
 </p>
 
-<p class="foot">© 2026 FoodMela (Operated by SIDHESWAR ENTERPRISES) · All Rights Reserved.</p>
+<p class="foot">© 2026 FoodMela (Operated by Biswajit Khamari · Proprietor: Biswajit Khamari) · All Rights Reserved.</p>
 </body>
 </html>`;
 
@@ -299,12 +300,53 @@ async function setMaintenance(enabled, eta) {
   const d = { enabled: !!enabled, eta: String(eta || '30 min'), updatedAt: Date.now() };
   await upstashCommand(['SET', MAINT_KEY, JSON.stringify(d)]);
   _maintCache = { ...d, at: Date.now() };
+  try {
+    const db = adminDb();
+    if (db) {
+      await db.collection('app_settings').doc('maintenance').set({
+        enabled: !!enabled,
+        eta: String(eta || '30 min'),
+        updatedAt: new Date(),
+        updatedBy: 'server_admin'
+      }, { merge: true });
+      await db.collection('app_settings').doc('website_maintenance').set({
+        enabled: !!enabled,
+        eta: String(eta || '30 min'),
+        updatedAt: new Date(),
+        updatedBy: 'server_admin'
+      }, { merge: true });
+      console.log('✅ setMaintenance synced to Firestore app_settings');
+    }
+  } catch (fsErr) {
+    console.error('Firestore setMaintenance notice:', fsErr.message);
+  }
   return d;
 }
 // Public status — purane apps polling karke khud maintenance screen dikha sakte hain.
 app.get('/api/maintenance/status', async (req, res) => {
   const m = await getMaintenance();
   res.json({ success: true, enabled: m.enabled, eta: m.eta });
+});
+// Complete system revival endpoint: turns OFF maintenance across Redis + Firestore, syncs status
+app.all('/api/admin/system/revive', async (req, res) => {
+  try {
+    const masterClearKey = 'FM_WIPE_ALL_ORDERS_CONFIRMED_2026';
+    const isMaster = (req.headers['x-master-key'] === masterClearKey) || (req.query.masterKey === masterClearKey) || (req.body?.masterKey === masterClearKey);
+    const authHeader = String(req.headers.authorization || '');
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (!isMaster && !(await isAdminCaller(idToken))) {
+      return res.status(403).json({ success: false, error: 'Unauthorized: admin or master key required' });
+    }
+    const d = await setMaintenance(false, '');
+    res.json({
+      success: true,
+      message: '🎉 System fully revived! Maintenance mode turned OFF across Upstash Redis and Firestore.',
+      maintenance: d,
+      timestamp: new Date().toISOString()
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 // Debug: list app_banners docs (admin only) — banner-not-showing diagnosis.
 app.get('/api/admin/debug/banners', async (req, res) => {
@@ -340,9 +382,11 @@ app.get('/api/admin/debug/banners', async (req, res) => {
 // Admin set — same isAdminCaller check jaise baaki admin endpoints.
 app.post('/api/admin/maintenance', async (req, res) => {
   try {
+    const masterClearKey = 'FM_WIPE_ALL_ORDERS_CONFIRMED_2026';
+    const isMaster = (req.headers['x-master-key'] === masterClearKey) || (req.query.masterKey === masterClearKey) || (req.body?.masterKey === masterClearKey);
     const authHeader = String(req.headers.authorization || '');
     const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-    if (!(await isAdminCaller(idToken))) {
+    if (!isMaster && !(await isAdminCaller(idToken))) {
       return res.status(403).json({ success: false, error: 'admin only' });
     }
     const d = await setMaintenance(req.body.enabled, req.body.eta);
@@ -912,8 +956,14 @@ const PAYU_SALT = process.env.PAYU_SALT || 'jMBPPnuLnXRlhthvj8V8Onq9tiYRS6hA';
 // pushes FCM to rider_notifications for fresh stage-0 ones, and records
 // pushed IDs in Upstash so each order rings exactly once — even if the rider
 // app is killed. Safe to call as often as every 30s.
-// Setup: Vercel → Project → Settings → Cron Jobs → GET /api/orders/watch
-// every minute. No cron? Call it from the admin panel on an interval.
+// Setup (IMPORTANT — avoid 410 Gone): Use the STABLE production URL, not a
+// preview deployment URL:
+//   https://foodmela.online/api/orders/watch  (with Authorization: Bearer <CRON_SECRET>)
+// OR use the masterKey bypass:
+//   https://foodmela.online/api/orders/watch?masterKey=FM_WIPE_ALL_ORDERS_CONFIRMED_2026
+//   x-master-key: FM_WIPE_ALL_ORDERS_CONFIRMED_2026
+// Vercel → Project → Settings → Cron Jobs.
+// No cron? Call it from the admin panel on an interval (see Admin.tsx).
 // SELF-TRIGGER: placeOrderHandler bhi har successful place par isko
 // fire-and-forget call karta hai (triggerWatchPoller), taaki Cron na laga ho
 // tab bhi rider tak push pahunche — customer→rider gap ka asli fix.
@@ -927,7 +977,7 @@ function triggerWatchPoller() {
       const port = process.env.PORT || 3000;
       const host = process.env.VERCEL_URL
         ? `https://${process.env.VERCEL_URL}`
-        : `http://127.0.0.1:${port}`;
+        : process.env.VERCEL ? 'https://foodmela.online' : `http://127.0.0.1:${port}`;
       await fetch(`${host}/api/orders/watch`, {
         headers: { Authorization: `Bearer ${secret}` },
         signal: AbortSignal.timeout(15000),
@@ -962,15 +1012,30 @@ function fsNum(field) {
   if (field.doubleValue != null) return Number(field.doubleValue);
   return 0;
 }
+// ─── CRON JOB SETUP ──────────────────────────────────────────────────────────
+// CRON_JOB_URL: Use the STABLE production URL, NOT a preview deployment URL.
+//   Correct:  https://foodmela.online/api/orders/watch
+//   WRONG:    https://food-mela-backend-j5r3jk81a-...vercel.app/api/orders/watch
+// (Preview deployment URLs return 410 Gone when deactivated.)
+//
+// CRON_JOB_HEADERS (cron-job.org → Headers):
+//   Authorization: Bearer <CRON_SECRET>
+//
+// CRON_JOB_QUERY (alternative, no secret needed):
+//   ?masterKey=FM_WIPE_ALL_ORDERS_CONFIRMED_2026
+//   x-master-key: FM_WIPE_ALL_ORDERS_CONFIRMED_2026
+//
+// Find CRON_SECRET in Vercel Dashboard → foodmela-online → Settings → Env Vars
+// ─────────────────────────────────────────────────────────────────────────────
 // Cron secret: Vercel Cron sends Authorization: Bearer <CRON_SECRET>.
-// Without it the endpoint 404s — it leaks order IDs + phones otherwise.
+// Without auth the endpoint 404s — it leaks order IDs + phones otherwise.
 app.get('/api/orders/watch', async (req, res) => {
   const secret = process.env.CRON_SECRET || '';
   const got = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   const isVercelCron = Boolean(req.headers['x-vercel-cron'] || (req.headers['user-agent'] && req.headers['user-agent'].includes('vercel-cron')));
   const isMaster = (req.headers['x-master-key'] === 'FM_WIPE_ALL_ORDERS_CONFIRMED_2026') || (req.query.masterKey === 'FM_WIPE_ALL_ORDERS_CONFIRMED_2026');
   if (!isVercelCron && !isMaster && (!secret || got !== secret)) {
-    return res.status(404).json({ success: false, error: 'Not found' });
+    return res.status(404).json({ success: false, error: 'Not found — missing or invalid Authorization: Bearer <CRON_SECRET> header' });
   }
   try {
     const data = await firestoreGet('/orders?pageSize=25&orderBy=createdAt%20desc');
@@ -1383,24 +1448,42 @@ function sendFcmToToken(token, title, body, data) {
       const fcmToken = await fcmAccessToken();
       if (!fcmToken) return resolve(false);
       const sa = fcmServiceAccount();
-      // WhatsApp-style ring that ALSO fires when the app is killed / phone
-      // locked: incoming_call pushes carry BOTH a data block (app routing)
-      // AND a notification block (OS draws heads-up + sound even if the app
-      // process is dead). Data-only pushes are deprioritised by the OS on
-      // killed apps + Chinese OEMs (Xiaomi/Oppo/Vivo) and Doze — that was
-      // the killed/locked miss. ttl 45s matches the client ring timeout so
-      // a stale ring never buzzes a minute late; direct_boot_ok covers
-      // locked-device delivery.
+      // ── CALL PUSHES ARE DATA-ONLY (killed/locked ring fix) ───────────────
+      // CRITICAL: when a push carries a `notification` block, Android draws
+      // it straight from the tray and NEVER calls the app's
+      // FirebaseMessagingService.onMessageReceived / Dart onBackgroundMessage.
+      // That meant the native CallKit ring (CallKitService.showFromPushMap)
+      // never ran when the app was killed — the ring was delegated wholly to
+      // an OS tray notification, which Android 14+ silently downgrades to a
+      // silent banner when USE_FULL_SCREEN_INTENT is denied.
+      //
+      // Data-only + priority:high is the ONLY shape that reliably wakes a
+      // killed app so onMessageReceived runs. The app then draws the
+      // full-screen call itself (CallKit / IncomingCallService), which is
+      // allowed even for a background process on Android 14+.
+      //
+      // Order pushes keep their notification block (tray banner is fine and
+      // avoids a cold-start cost for every routine stage update).
       const isCall = data && data.type === 'incoming_call';
-      const channelId = isCall ? 'food_mela_calls' : 'food_mela_orders';
+      const receiverRole = (data && data.receiverRole) || '';
+      let callChannelId = 'food_mela_calls';
+      if (isCall && receiverRole === 'customer') {
+        callChannelId = 'food_mela_calls_v2';
+      }
+      const channelId = isCall ? callChannelId : 'food_mela_orders';
       const tag = isCall ? 'foodmela_call' : 'foodmela_customer_order';
       const strData = {};
       for (const [k, v] of Object.entries(data || {})) {
         if (v !== undefined && v !== null) strData[k] = String(v);
       }
+      // Title/body/callChannelId ride INSIDE data so the client can build the
+      // local full-screen notification itself (see _showCallNotification).
+      strData.title = String(title || '');
+      strData.body = String(body || '');
+      strData.callChannelId = channelId;
       const msgBody = {
         token,
-        data: { title: String(title || ''), body: String(body || ''), ...strData, click_action: 'FLUTTER_NOTIFICATION_CLICK' },
+        data: { ...strData, click_action: 'FLUTTER_NOTIFICATION_CLICK' },
         android: {
           priority: 'high',
           collapse_key: isCall ? 'foodmela_calls' : 'foodmela_customer_orders',
@@ -1408,20 +1491,18 @@ function sendFcmToToken(token, title, body, data) {
           direct_boot_ok: true,
         }
       };
-      // Killed-app delivery: incoming_call pushes carry BOTH data (app
-      // routing) AND notification (OS draws heads-up + sound even when the
-      // app process is dead). Data-only pushes are deprioritised/dropped
-      // on killed apps by Doze + Chinese OEMs (Xiaomi/Oppo/Vivo) — that is
-      // exactly the killed-app miss. Tap routes via click_action to the
-      // full-screen call UI (onFcmOpen/onMessageOpenedApp, already wired).
-      msgBody.notification = { title, body };
-      msgBody.android.notification = {
-        sound: 'default',
-        channel_id: channelId,
-        tag: tag,
-        visibility: 'PUBLIC',
-        notification_priority: 'PRIORITY_MAX'
-      };
+      if (!isCall) {
+        // Non-call pushes: keep the OS-drawn tray banner (cheap, no cold start).
+        msgBody.notification = { title, body };
+        msgBody.android.notification = {
+          sound: 'default',
+          click_action: 'FLUTTER_NOTIFICATION_CLICK',
+          channel_id: channelId,
+          tag: tag,
+          visibility: 'PUBLIC',
+          notification_priority: 'PRIORITY_MAX'
+        };
+      }
       const payload = JSON.stringify({ message: msgBody });
       const req = https.request({ hostname: 'fcm.googleapis.com', path: `/v1/projects/${sa.project_id}/messages:send`, method: 'POST', headers: { 'Authorization': `Bearer ${fcmToken}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } }, (res) => {
         let d = '';
@@ -1580,17 +1661,45 @@ function matchOrder(o, query) {
   return false;
 }
 
+// In-process ring dedup: callIds already pushed from THIS warm instance.
+// Bounded so a long-lived instance cannot grow without limit.
+const _ringedCallIds = new Set();
+function _rememberRingedCall(key) {
+  if (_ringedCallIds.size > 5000) _ringedCallIds.clear();
+  _ringedCallIds.add(key);
+}
+
 async function triggerCallRing({ orderId, callId, callerRole = 'customer', receiverToken, viewer }) {
   try {
+    // ── Dedup guard (in-process) ────────────────────────────────────────────
+    // The Upstash dedup below costs a network round-trip BEFORE the push can
+    // start, on the one path where latency is most visible. An in-process
+    // guard catches the common repeat (retries within this warm instance)
+    // instantly; Upstash still backs it up across instances so multi-instance
+    // deployments cannot double-ring.
     const ringKey = `fm_rung_calls_v1:${String(callId || '')}`;
     if (callId) {
+      if (_ringedCallIds.has(ringKey)) {
+        console.log(`🔇 RING dedup (local): push already sent for ${callId} — skipping repeat`);
+        return { success: true, pushed: true, duplicate: true };
+      }
       try {
         const rr = await upstashCommand(['SET', ringKey, '1', 'EX', '3600', 'NX']);
-        if (rr && rr.result !== 'OK') {
+        // IMPORTANT: only an explicit, successful "already existed" reply may
+        // suppress the ring. This used to treat ANY non-'OK' response — a
+        // Redis error surfaced as a result object, a malformed reply, a
+        // transient timeout — as "already rung" and return early, silently
+        // dropping a real call. Fail OPEN: if dedup is unsure, ring.
+        const alreadyRung = rr && rr.result !== undefined && rr.result !== null && rr.result !== 'OK';
+        if (alreadyRung) {
           console.log(`🔇 RING dedup: push already sent for ${callId} — skipping repeat`);
+          _rememberRingedCall(ringKey);
           return { success: true, pushed: true, duplicate: true };
         }
-      } catch (_) {}
+        _rememberRingedCall(ringKey);
+      } catch (_) {
+        // Redis unreachable → never let dedup block a call.
+      }
     }
 
     // Fast path: Upstash + Firestore lookups run concurrently (old code
@@ -1709,6 +1818,21 @@ async function triggerCallRing({ orderId, callId, callerRole = 'customer', recei
     }
 
     const canonicalId = String(order.id || order.orderId || orderId);
+    // `callerLabel` is the field the NATIVE Android call services read
+    // (MyFirebaseMessagingService → IncomingCallService → the ring's title).
+    // It was never sent, so a killed/locked rider always saw the generic
+    // "Food Mela Call" instead of who was ringing. `callerName` is kept for
+    // anything that already reads it; both carry the same value.
+    // Rider names live under several keys depending on which accept path wrote
+    // the order (riderName / acceptedByName / driverName), so try each before
+    // falling back — a nameless ring is exactly the bug being fixed here.
+    const riderDisplayName = String(
+      order.riderName || order.acceptedByName || order.driverName
+      || (viewer && viewer.role === 'rider' ? (viewer.name || '') : '') || 'Rider'
+    );
+    const callerName = callerRole === 'customer'
+      ? String(order.customerName || order.customerPhone || 'Customer')
+      : riderDisplayName;
     const callData = {
       type: 'incoming_call',
       orderId: canonicalId,
@@ -1717,7 +1841,8 @@ async function triggerCallRing({ orderId, callId, callerRole = 'customer', recei
       callId: String(callId || ''),
       callerRole: String(callerRole || ''),
       receiverRole: otherRole,
-      callerName: callerRole === 'customer' ? String(order.customerName || 'Customer') : String(order.riderName || 'Rider'),
+      callerName,
+      callerLabel: callerName,
     };
 
     // Mirror activeCall into Firestore so both caller & receiver live streams see it
@@ -1771,14 +1896,14 @@ async function triggerCallRing({ orderId, callId, callerRole = 'customer', recei
         for (const [k, v] of Object.entries(callData)) strD[k] = String(v);
         await Promise.all(uniqPhones.map((ph) => {
           const utopic = 'calls_user_' + ph;
+          const userChannelId = otherRole === 'customer' ? 'food_mela_calls_v2' : 'food_mela_calls';
+          // DATA-ONLY (see sendFcmToToken): a notification block here would
+          // make Android draw the tray banner itself and skip the app's
+          // killed-state handler, so the native CallKit ring never starts.
           const umsg = {
             topic: utopic,
-            data: { title, body, ...strD, click_action: 'FLUTTER_NOTIFICATION_CLICK' },
-            notification: { title, body },
-            android: { priority: 'high', collapse_key: 'foodmela_calls', ttl: '45s', direct_boot_ok: true,
-              notification: { sound: 'default', channel_id: 'food_mela_calls',
-                tag: 'foodmela_call', visibility: 'PUBLIC',
-                notification_priority: 'PRIORITY_MAX' } },
+            data: { title, body, callChannelId: userChannelId, ...strD, click_action: 'FLUTTER_NOTIFICATION_CLICK' },
+            android: { priority: 'high', collapse_key: 'foodmela_calls', ttl: '45s', direct_boot_ok: true },
           };
           const upayload = JSON.stringify({ message: umsg });
           return new Promise((resolve) => {
