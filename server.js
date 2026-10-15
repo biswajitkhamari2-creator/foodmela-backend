@@ -2627,9 +2627,9 @@ app.post('/api/auth/rider/token', maintenanceGate, async (req, res) => {
     const approval = (uData && uData.approvalStatus) || '';
     const blocked = (uData && uData.accountStatus) === 'blocked';
     const phone = String((uData && uData.phone) || (docIds.length > 1 ? docIds[1] : '')).replace(/[^0-9]/g, '').slice(-10);
-    if (role !== 'delivery_partner') return res.status(403).json({ success: false, error: 'Rider account required' });
+    if (role !== 'delivery_partner' && role !== 'rider') return res.status(403).json({ success: false, error: 'Rider account required' });
     if (blocked) return res.status(403).json({ success: false, error: 'Account is blocked' });
-    if (approval !== 'approved') return res.status(403).json({ success: false, error: 'Account awaiting approval' });
+    if (approval && approval !== 'approved') return res.status(403).json({ success: false, error: 'Account awaiting approval' });
     if (phone.length < 10) return res.status(403).json({ success: false, error: 'No phone linked to rider account' });
 
     let firebaseToken = null;
