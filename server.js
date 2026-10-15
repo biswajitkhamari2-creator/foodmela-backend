@@ -28,8 +28,10 @@ const ALLOWED_ORIGINS = new Set([
   'https://foodmela-admin.vercel.app',
   'https://food-mela-admin.vercel.app',
   'https://food-mela-backend.vercel.app',
+  'https://foodmela-pixel-dash-1l3mmbj7e-biswajits-projects-52f7c19e.vercel.app',
   'http://localhost:3000',
   'http://localhost:5173',
+  'http://localhost:5182',
 ]);
 app.use(cors({
   origin: (origin, cb) => {
@@ -3380,6 +3382,31 @@ app.post('/api/auth/otp/send', maintenanceGate, async (req, res) => {
     const raw = String(req.body.phone || '').replace(/[^0-9]/g, '');
     const phone = raw.slice(-10);
     if (phone.length < 10) return res.status(400).json({ success: false, error: 'Valid 10-digit mobile number required' });
+
+    // ── OTP RESEND COOLDOWN (per-phone, 60s) ──────────────────────────────
+    // Stops rapid re-taps / API hammering from minting a new OTP every time
+    // (which invalidates the previous code and confuses users about which OTP
+    // is valid, plus burns an SMS per send). Redis-backed so it holds across
+    // serverless instances. Demo reviewer number is exempt (no SMS anyway).
+    // Responds 429 with retryAfterSec so the app can show "wait Xs".
+    const OTP_COOLDOWN_SEC = 60;
+    if (phone !== '9999999999') {
+      try {
+        // SETNX (1 = key was absent → first send, proceed; 0 = cooldown live).
+        // Separate EXPIRE after a successful SETNX — the combined
+        // SET..EX..NX form proved unreliable against Upstash REST (returned
+        // OK on existing keys), while SETNX semantics are unambiguous.
+        const cd = await upstashCommand(['SETNX', `fm_otp_cd:${phone}`, '1']);
+        const first = cd && (cd.result === 1 || cd.result === '1');
+        if (!first) {
+          const ttl = await upstashCommand(['TTL', `fm_otp_cd:${phone}`]);
+          const wait = (ttl && Number.isFinite(Number(ttl.result)) && Number(ttl.result) > 0) ? Number(ttl.result) : OTP_COOLDOWN_SEC;
+          res.setHeader('Retry-After', String(wait));
+          return res.status(429).json({ success: false, error: `Please wait ${wait}s before requesting a new OTP`, retryAfterSec: wait });
+        }
+        await upstashCommand(['EXPIRE', `fm_otp_cd:${phone}`, OTP_COOLDOWN_SEC]);
+      } catch (_) { /* fail-open: Redis down must never block login */ }
+    }
 
     // For Google Reviewer demo number
     let otp;
