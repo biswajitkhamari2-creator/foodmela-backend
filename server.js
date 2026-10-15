@@ -395,6 +395,67 @@ app.post('/api/admin/maintenance', async (req, res) => {
     res.status(500).json({ success: false, error: 'save failed' });
   }
 });
+// ─── FESTIVAL THEME (remote-controlled, no app update) ───────────────────────
+// Writes app_settings/festival_theme — the Customer App renders the animated
+// banner + one-time blast from this doc. Presets: diwali | holi | off.
+// Same master-key gate as /system/revive.
+app.all('/api/admin/festival-theme', async (req, res) => {
+  try {
+    const masterClearKey = 'FM_WIPE_ALL_ORDERS_CONFIRMED_2026';
+    const q = req.query || {};
+    const b = req.body || {};
+    const isMaster = (req.headers['x-master-key'] === masterClearKey) || (q.masterKey === masterClearKey) || (b.masterKey === masterClearKey);
+    const authHeader = String(req.headers.authorization || '');
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (!isMaster && !(await isAdminCaller(idToken))) {
+      return res.status(403).json({ success: false, error: 'admin only' });
+    }
+    const PRESETS = {
+      diwali: {
+        isActive: true, festivalName: 'Diwali',
+        lottieUrl: 'https://assets2.lottiefiles.com/packages/lf20_u4yrau.json',
+        greetingTitle: 'Shubh Deepawali ✨',
+        greetingSubtitle: 'Celebrate with festive sweets & flat 20% OFF',
+        gradientColors: ['#7B1E0E', '#F21F3D', '#FF7900'],
+        showOneTimeBlast: true,
+      },
+      holi: {
+        isActive: true, festivalName: 'Holi',
+        lottieUrl: 'https://assets9.lottiefiles.com/packages/lf20_rovf9gzu.json',
+        greetingTitle: 'Happy Holi 🎨',
+        greetingSubtitle: 'Colours, sweets & festive feasts up to 25% OFF',
+        gradientColors: ['#7C3AED', '#EC4899', '#F59E0B'],
+        showOneTimeBlast: true,
+      },
+      newyear: {
+        isActive: true, festivalName: 'New Year',
+        lottieUrl: 'https://assets6.lottiefiles.com/packages/lf20_obhph3sh.json',
+        greetingTitle: 'Happy New Year 🎉',
+        greetingSubtitle: 'Fresh flavours, fresh beginnings — flat 15% OFF',
+        gradientColors: ['#1E3A8A', '#7C3AED', '#EC4899'],
+        showOneTimeBlast: true,
+      },
+      off: {
+        isActive: false, festivalName: '', lottieUrl: '',
+        greetingTitle: '', greetingSubtitle: '', gradientColors: [],
+        showOneTimeBlast: false,
+      },
+    };
+    const which = String(q.preset || b.preset || 'diwali').toLowerCase();
+    // Custom override: pass full fields to use your own theme instead.
+    const custom = {};
+    for (const k of ['isActive', 'festivalName', 'lottieUrl', 'greetingTitle', 'greetingSubtitle', 'gradientColors', 'showOneTimeBlast']) {
+      if (b[k] !== undefined) custom[k] = b[k];
+    }
+    const theme = { ...(PRESETS[which] || PRESETS.diwali), ...custom };
+    const db = adminDb();
+    if (!db) return res.status(500).json({ success: false, error: 'firestore unavailable' });
+    await db.collection('app_settings').doc('festival_theme').set(theme, { merge: true });
+    res.json({ success: true, preset: which, theme });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
 // ─── ADMIN ONE-TIME DEDUP: hide ghost order docs without deleting history ──
 // Ghost docs = TMP-xxx placeholders, dash-less FM71234567 twins, and any doc
 // whose orderId/clientRef duplicates another doc's canonical FM-xxx id.
@@ -1464,7 +1525,8 @@ function sendFcmToToken(token, title, body, data) {
       //
       // Order pushes keep their notification block (tray banner is fine and
       // avoids a cold-start cost for every routine stage update).
-      const isCall = data && data.type === 'incoming_call';
+      const isCall = data && (data.type === 'incoming_call' || data.type === 'call_cancelled' || data.type === 'call_ended' || data.type === 'call_rejected' || data.type === 'call_missed');
+      const isCancel = data && (data.type === 'call_cancelled' || data.type === 'call_ended' || data.type === 'call_rejected' || data.type === 'call_missed');
       const receiverRole = (data && data.receiverRole) || '';
       let callChannelId = 'food_mela_calls';
       if (isCall && receiverRole === 'customer') {
@@ -1487,7 +1549,7 @@ function sendFcmToToken(token, title, body, data) {
         android: {
           priority: 'high',
           collapse_key: isCall ? 'foodmela_calls' : 'foodmela_customer_orders',
-          ttl: isCall ? '45s' : '86400s',
+          ttl: isCancel ? '10s' : (isCall ? '30s' : '86400s'),
           direct_boot_ok: true,
         }
       };
@@ -1778,18 +1840,39 @@ async function triggerCallRing({ orderId, callId, callerRole = 'customer', recei
       token = String((fsData && fsData[key]) || (order && order[key]) || '').trim();
     }
 
-    // Fallback: Check rider collections or users collection (all in parallel).
+    let resolvedRiderPhone = '';
+    // Fallback: Check users collection by partnerId, doc ID, or phone (all in parallel).
     if (!token) {
       try {
         const db = adminDb();
         if (db) {
           if (otherRole === 'rider' && riderIds.length) {
-            const rdocs = await Promise.all(
-              riderIds.map((rid) => db.collection('riders').doc(rid).get().catch(() => null))
+            // 1. Direct doc lookup in 'users' collection (e.g. LIP-7707, phone, etc.)
+            const udocs = await Promise.all(
+              riderIds.map((rid) => db.collection('users').doc(rid).get().catch(() => null))
             );
-            for (const rdoc of rdocs) {
-              const t = String((rdoc && rdoc.exists && rdoc.data().fcmToken) || '').trim();
-              if (t) { token = t; break; }
+            for (const u of udocs) {
+              if (u && u.exists) {
+                const ud = u.data() || {};
+                const t = String(ud.fcmToken || '').trim();
+                const uph = String(ud.phone || '').replace(/[^0-9]/g, '').slice(-10);
+                if (uph.length >= 10 && !resolvedRiderPhone) resolvedRiderPhone = uph;
+                if (t && !token) token = t;
+              }
+            }
+            // 2. Query 'users' collection where partnerId == rid
+            if (!token || !resolvedRiderPhone) {
+              for (const rid of riderIds) {
+                const q = await db.collection('users').where('partnerId', '==', rid).limit(1).get().catch(() => null);
+                if (q && !q.empty) {
+                  const ud = q.docs[0].data() || {};
+                  const t = String(ud.fcmToken || '').trim();
+                  const uph = String(ud.phone || '').replace(/[^0-9]/g, '').slice(-10);
+                  if (uph.length >= 10 && !resolvedRiderPhone) resolvedRiderPhone = uph;
+                  if (t && !token) token = t;
+                  if (token && resolvedRiderPhone) break;
+                }
+              }
             }
           }
           if (!token) {
@@ -1799,6 +1882,7 @@ async function triggerCallRing({ orderId, callId, callerRole = 'customer', recei
                 const d = id.replace(/[^0-9]/g, '').slice(-10);
                 if (d.length >= 10) phones.push(d, '91' + d);
               }
+              if (resolvedRiderPhone) phones.push(resolvedRiderPhone, '91' + resolvedRiderPhone);
             } else if (orderPhone.length >= 10) {
               phones.push(orderPhone, '91' + orderPhone);
             }
@@ -1843,6 +1927,7 @@ async function triggerCallRing({ orderId, callId, callerRole = 'customer', recei
       receiverRole: otherRole,
       callerName,
       callerLabel: callerName,
+      createdAtMs: String(Date.now()),
     };
 
     // Mirror activeCall into Firestore so both caller & receiver live streams see it
@@ -1857,6 +1942,7 @@ async function triggerCallRing({ orderId, callId, callerRole = 'customer', recei
           receiverRole: otherRole,
           status: 'ringing',
           createdAt: new Date().toISOString(),
+          createdAtMs: Date.now(),
         };
         const docIdsToUpdate = new Set([canonicalId, String(orderId)]);
         if (fsDocId) docIdsToUpdate.add(fsDocId);
@@ -1887,6 +1973,9 @@ async function triggerCallRing({ orderId, callId, callerRole = 'customer', recei
           const d = id.replace(/[^0-9]/g, '').slice(-10);
           if (d.length >= 10) targetPhones.push(d);
         }
+        if (resolvedRiderPhone && resolvedRiderPhone.length >= 10) {
+          targetPhones.push(resolvedRiderPhone);
+        }
       }
       const uniqPhones = [...new Set(targetPhones)];
       const utok = await fcmAccessToken();
@@ -1903,7 +1992,7 @@ async function triggerCallRing({ orderId, callId, callerRole = 'customer', recei
           const umsg = {
             topic: utopic,
             data: { title, body, callChannelId: userChannelId, ...strD, click_action: 'FLUTTER_NOTIFICATION_CLICK' },
-            android: { priority: 'high', collapse_key: 'foodmela_calls', ttl: '45s', direct_boot_ok: true },
+            android: { priority: 'high', collapse_key: 'foodmela_calls', ttl: '30s', direct_boot_ok: true },
           };
           const upayload = JSON.stringify({ message: umsg });
           return new Promise((resolve) => {
@@ -1937,6 +2026,165 @@ async function triggerCallRing({ orderId, callId, callerRole = 'customer', recei
   }
 }
 
+// ── Instant Call Cancellation & Hangup Engine ──
+async function triggerCallCancel({ orderId, callId, reason = 'cancelled', viewer }) {
+  try {
+    let order = null;
+    try {
+      const orders = await readOrders();
+      order = orders.find(o => matchOrder(o, orderId)) || null;
+    } catch (_) {}
+
+    let fsData = null;
+    let fsDocId = null;
+    try {
+      const db = adminDb();
+      if (db) {
+        const canonicalId = orderId;
+        const norm = String(orderId).startsWith('FM-') ? String(orderId) : `FM-${String(orderId).replace(/^FM-?/i, '')}`;
+        let snap = await db.collection('orders').doc(String(canonicalId)).get();
+        if (!snap.exists && orderId !== canonicalId) snap = await db.collection('orders').doc(String(orderId)).get();
+        if (!snap.exists && norm !== orderId) snap = await db.collection('orders').doc(norm).get();
+        if (!snap.exists) {
+          let q = await db.collection('orders').where('orderId', '==', String(orderId)).limit(1).get();
+          if (q.empty && norm !== orderId) q = await db.collection('orders').where('orderId', '==', norm).limit(1).get();
+          if (q.empty) q = await db.collection('orders').where('clientRef', '==', String(orderId)).limit(1).get();
+          if (!q.empty) snap = q.docs[0];
+        }
+        if (snap && snap.exists) {
+          fsDocId = snap.id;
+          fsData = snap.data() || {};
+          order = order ? { ...order, ...fsData } : { id: snap.id, ...fsData };
+        }
+      }
+    } catch (_) {}
+
+    if (!order) return { success: false, error: 'Order not found' };
+
+    const canonicalId = String(order.id || order.orderId || orderId);
+    const cancelData = {
+      type: 'call_cancelled',
+      orderId: canonicalId,
+      callId: String(callId || ''),
+      reason: String(reason || 'cancelled'),
+      createdAtMs: String(Date.now()),
+    };
+
+    // Mirror cancellation to Firestore activeCall so live listeners stop ringing immediately
+    try {
+      const db = adminDb();
+      if (db) {
+        const docIdsToUpdate = new Set([canonicalId, String(orderId)]);
+        if (fsDocId) docIdsToUpdate.add(fsDocId);
+        if (order.clientRef) docIdsToUpdate.add(String(order.clientRef));
+        for (const did of docIdsToUpdate) {
+          db.collection('orders').doc(did).set({
+            activeCall: {
+              callId: String(callId || ''),
+              status: String(reason || 'cancelled'),
+              endedAt: new Date().toISOString(),
+            }
+          }, { merge: true }).catch(() => {});
+        }
+      }
+    } catch (_) {}
+
+    // Collect all tokens & phones for BOTH customer and rider so whoever was ringing stops ringing immediately
+    const tokens = new Set();
+    const phones = new Set();
+
+    if (order.customerFcmToken) tokens.add(String(order.customerFcmToken).trim());
+    if (order.riderFcmToken) tokens.add(String(order.riderFcmToken).trim());
+    if (fsData && fsData.customerFcmToken) tokens.add(String(fsData.customerFcmToken).trim());
+    if (fsData && fsData.riderFcmToken) tokens.add(String(fsData.riderFcmToken).trim());
+
+    const custPhone = String(order.phone || order.customerPhone || '').replace(/[^0-9]/g, '').slice(-10);
+    if (custPhone.length >= 10) phones.add(custPhone);
+
+    const riderCandidateIds = [
+      order.acceptedBy,
+      order.riderId,
+      order.riderPhone,
+      order.acceptedByPhone,
+      order.riderPartnerId,
+      order.partnerId,
+    ].map(v => String(v || '').trim()).filter(Boolean);
+
+    // Look up tokens and phones for rider candidate IDs in Firestore users collection
+    try {
+      const db = adminDb();
+      if (db) {
+        for (const rid of riderCandidateIds) {
+          const d = rid.replace(/[^0-9]/g, '').slice(-10);
+          if (d.length >= 10) phones.add(d);
+          const uDoc = await db.collection('users').doc(rid).get().catch(() => null);
+          if (uDoc && uDoc.exists) {
+            const ud = uDoc.data() || {};
+            if (ud.fcmToken) tokens.add(String(ud.fcmToken).trim());
+            const uph = String(ud.phone || '').replace(/[^0-9]/g, '').slice(-10);
+            if (uph.length >= 10) phones.add(uph);
+          }
+        }
+        for (const rid of riderCandidateIds) {
+          const q = await db.collection('users').where('partnerId', '==', rid).limit(1).get().catch(() => null);
+          if (q && !q.empty) {
+            const ud = q.docs[0].data() || {};
+            if (ud.fcmToken) tokens.add(String(ud.fcmToken).trim());
+            const uph = String(ud.phone || '').replace(/[^0-9]/g, '').slice(-10);
+            if (uph.length >= 10) phones.add(uph);
+          }
+        }
+      }
+    } catch (_) {}
+
+    // Dispatch direct FCM cancellation push (DATA-ONLY, high priority, ttl: 10s, collapse_key: foodmela_calls)
+    for (const t of tokens) {
+      if (t) sendFcmToToken(t, '', '', cancelData).catch(() => {});
+    }
+
+    // Also dispatch to topics calls_user_<phone>
+    const utok = await fcmAccessToken();
+    const usa = fcmServiceAccount();
+    if (utok && usa && phones.size) {
+      const strD = {};
+      for (const [k, v] of Object.entries(cancelData)) strD[k] = String(v);
+      await Promise.all([...phones].map((ph) => {
+        const utopic = 'calls_user_' + ph;
+        const umsg = {
+          topic: utopic,
+          data: { ...strD, click_action: 'FLUTTER_NOTIFICATION_CLICK' },
+          android: { priority: 'high', collapse_key: 'foodmela_calls', ttl: '10s', direct_boot_ok: true },
+        };
+        const upayload = JSON.stringify({ message: umsg });
+        return new Promise((resolve) => {
+          const rq = https.request({
+            hostname: 'fcm.googleapis.com',
+            path: '/v1/projects/' + usa.project_id + '/messages:send',
+            method: 'POST',
+            headers: {
+              'Authorization': 'Bearer ' + utok,
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(upayload)
+            }
+          }, (rs) => {
+            let d = ''; rs.on('data', c => d += c);
+            rs.on('end', () => resolve(rs.statusCode < 300));
+          });
+          rq.on('error', () => resolve(false));
+          rq.write(upayload);
+          rq.end();
+        });
+      }));
+    }
+
+    console.log(`🔕 CALL CANCEL dispatched for order ${orderId} (${reason}) to ${tokens.size} tokens & ${phones.size} topics`);
+    return { success: true };
+  } catch (err) {
+    console.error('triggerCallCancel error:', err);
+    return { success: false, error: err.message };
+  }
+}
+
 // ── POST /api/calls/:orderId/ring { callId, callerRole, receiverToken? } ──
 app.post('/api/calls/:orderId/ring', async (req, res) => {
   try {
@@ -1950,6 +2198,19 @@ app.post('/api/calls/:orderId/ring', async (req, res) => {
     res.json(result);
   } catch (e) {
     res.json({ success: true, pushed: false, reason: e.message });
+  }
+});
+
+// ── POST /api/calls/:orderId/cancel { callId, reason } ──
+app.post('/api/calls/:orderId/cancel', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { callId, reason } = req.body || {};
+    let viewer = viewerFrom(req);
+    const result = await triggerCallCancel({ orderId, callId, reason: reason || 'cancelled', viewer });
+    res.json(result);
+  } catch (e) {
+    res.json({ success: true, cancelled: false, reason: e.message });
   }
 });
 
@@ -6460,7 +6721,7 @@ app.get('/api/admin/orders/archived', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 try {
   const { registerCallRoutes } = require('./agoraCalls');
-  registerCallRoutes(app, { readOrders, verifyApiToken, triggerCallRing });
+  registerCallRoutes(app, { readOrders, verifyApiToken, triggerCallRing, triggerCallCancel });
   console.log('📞 Agora calling routes mounted');
 } catch (e) {
   console.error('Calling routes mount notice:', e.message);

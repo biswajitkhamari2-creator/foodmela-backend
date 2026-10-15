@@ -374,7 +374,7 @@ const SELF_RETRY_SUPERSEDE_MS = 90_000;
 
 // ─── Route registration ─────────────────────────────────────────────────────
 // verifyApiToken is injected from server.js (same HMAC session tokens).
-function registerCallRoutes(app, { readOrders, verifyApiToken, triggerCallRing }) {
+function registerCallRoutes(app, { readOrders, verifyApiToken, triggerCallRing, triggerCallCancel }) {
   const viewerOf = (req) => {
     try {
       const h = String(req.headers.authorization || '');
@@ -716,6 +716,14 @@ function registerCallRoutes(app, { readOrders, verifyApiToken, triggerCallRing }
       log.endedAt = new Date().toISOString();
       await writeCallLogs(logs);
       syncCallStatusToFirestore(log, req.params.orderId, 'ended').catch(() => {});
+      if (typeof triggerCallCancel === 'function') {
+        triggerCallCancel({
+          orderId: req.params.orderId,
+          callId: log.id,
+          reason: 'ended',
+          viewer,
+        }).catch((e) => console.error('call cancel stop notice:', e.message));
+      }
       res.json({ success: true, log });
     } catch (e) {
       res.status(500).json({ success: false, error: e.message });
@@ -757,7 +765,17 @@ function registerCallRoutes(app, { readOrders, verifyApiToken, triggerCallRing }
       log.status = status;
       if (status === 'accepted') log.startedAt = log.startedAt || new Date().toISOString();
       if (duration) log.duration = Number(duration);
-      if (TERMINAL_CALL_STATES.includes(status)) log.endedAt = new Date().toISOString();
+      if (TERMINAL_CALL_STATES.includes(status)) {
+        log.endedAt = new Date().toISOString();
+        if (typeof triggerCallCancel === 'function') {
+          triggerCallCancel({
+            orderId: req.params.orderId,
+            callId: log.id,
+            reason: status,
+            viewer,
+          }).catch((e) => console.error('call cancel status notice:', e.message));
+        }
+      }
       await writeCallLogs(logs);
       syncCallStatusToFirestore(log, req.params.orderId, status).catch(() => {});
       res.json({ success: true, log });
@@ -802,6 +820,13 @@ function registerCallRoutes(app, { readOrders, verifyApiToken, triggerCallRing }
       log.endedAt = new Date().toISOString();
       await writeCallLogs(logs);
       syncCallStatusToFirestore(log, req.params.orderId, 'missed').catch(() => {});
+      if (typeof triggerCallCancel === 'function') {
+        triggerCallCancel({
+          orderId: req.params.orderId,
+          callId: log.id,
+          reason: 'missed',
+        }).catch((e) => console.error('call cancel timeout notice:', e.message));
+      }
       res.json({ success: true, log });
     } catch (e) {
       res.status(500).json({ success: false, error: e.message });
